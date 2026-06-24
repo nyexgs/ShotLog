@@ -8,15 +8,19 @@
     <AssemblyName>ShotLog</AssemblyName>
     <RootNamespace>ShotLog</RootNamespace>
     <ApplicationIcon>ShotLog.ico</ApplicationIcon>
-    <Version>0.10.0</Version>
-    <FileVersion>0.10.0.0</FileVersion>
-    <AssemblyVersion>0.10.0.0</AssemblyVersion>
-    <InformationalVersion>0.10.0</InformationalVersion>
+    <Version>0.12.0</Version>
+    <FileVersion>0.12.0.0</FileVersion>
+    <AssemblyVersion>0.12.0.0</AssemblyVersion>
+    <InformationalVersion>0.12.0</InformationalVersion>
     <PublishSingleFile>true</PublishSingleFile>
     <SelfContained>true</SelfContained>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
   </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="NAudio" Version="2.2.1" />
+  </ItemGroup>
 
   <ItemGroup>
     <EmbeddedResource Include="ffmpeg.exe" LogicalName="ffmpeg.exe" Condition="Exists('ffmpeg.exe')" />

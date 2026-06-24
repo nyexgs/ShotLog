@@ -8,6 +8,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using Microsoft.Win32;
+using NAudio.Wave;
 using Timer = System.Windows.Forms.Timer;
 
 namespace ShotLog;
@@ -27,7 +28,7 @@ internal static class Program
             return version;
         }
 
-        return assembly.GetName().Version ?? new Version(0, 10, 0);
+        return assembly.GetName().Version ?? new Version(0, 12, 0);
     }
 
     [STAThread]
@@ -156,6 +157,14 @@ internal sealed class MainForm : Form
     private DateTime _recordingStartedAt;
     private string _activeEngineName = "대기 중";
     private readonly StringBuilder _ffmpegLog = new();
+    private bool _forceGdiUntilManualStart;
+
+    private WasapiLoopbackCapture? _audioCapture;
+    private WaveFormat? _audioFormat;
+    private readonly object _audioLock = new();
+    private readonly List<byte> _audioRing = new();
+    private long _audioBytesCaptured;
+    private bool _audioRunning;
 
     private int BufferSeconds => (int)_secondsInput.Value;
     private int Fps => (int)_fpsInput.Value;
@@ -200,7 +209,7 @@ internal sealed class MainForm : Form
         _bufferTimer.Tick += (_, _) => UpdateBufferState();
         _bufferTimer.Start();
 
-        StartRecordingAsync();
+        _ = StartRecordingAsync();
 
         if (_settings.CheckUpdatesOnStart)
         {
@@ -369,6 +378,7 @@ internal sealed class MainForm : Form
             }
             else
             {
+                _forceGdiUntilManualStart = false;
                 await StartRecordingAsync();
             }
         };
@@ -666,6 +676,7 @@ internal sealed class MainForm : Form
                     _engineLabel.Text = "캡처 엔진 : " + attempt.Name;
                     _toggleRecordButton.Text = "상시녹화 중지";
                     _toggleRecordButton.Enabled = true;
+                    StartAudioCaptureIfNeeded();
                     Log("상시녹화가 시작되었습니다.");
                     return;
                 }
@@ -719,6 +730,7 @@ internal sealed class MainForm : Form
             }
         }
 
+        StopAudioCapture();
         process?.Dispose();
         _recording = false;
         _activeEngineName = "대기 중";
@@ -760,13 +772,24 @@ internal sealed class MainForm : Form
         {
             if (!_manualStopping && _recording)
             {
+                var previousEngine = _activeEngineName;
+
                 SafeUi(() =>
                 {
                     _recording = false;
+                    _ffmpegProcess = null;
+                    StopAudioCapture();
                     _statusLabel.Text = "상시녹화 중단됨";
                     _engineLabel.Text = "캡처 엔진 : 중단됨";
                     _toggleRecordButton.Text = "상시녹화 시작";
                     Log("FFmpeg 캡처 프로세스가 종료되었습니다. " + GetLastFfmpegLine());
+
+                    if (_settings.CaptureMode == "auto" && previousEngine.Contains("DDA", StringComparison.OrdinalIgnoreCase))
+                    {
+                        _forceGdiUntilManualStart = true;
+                        Log("DDA 캡처가 중단되어 호환 GDI로 자동 재시도합니다.");
+                        _ = Task.Delay(800).ContinueWith(_ => SafeUi(() => _ = StartRecordingAsync()));
+                    }
                 });
             }
         };
@@ -781,61 +804,163 @@ internal sealed class MainForm : Form
     {
         var attempts = new List<CaptureAttempt>();
         var mode = _settings.CaptureMode;
-        var audio = _settings.IncludeAudio;
 
         if (mode is "auto" or "dda")
         {
-            attempts.Add(BuildDdaAttempt(audio));
-            if (audio)
+            if (!_forceGdiUntilManualStart || mode == "dda")
             {
-                attempts.Add(BuildDdaAttempt(false));
+                attempts.Add(BuildDdaAttempt());
             }
         }
 
         if (mode is "auto" or "gdi")
         {
-            attempts.Add(BuildGdiAttempt(audio));
-            if (audio)
-            {
-                attempts.Add(BuildGdiAttempt(false));
-            }
+            attempts.Add(BuildGdiAttempt());
         }
 
         return attempts;
     }
 
-    private CaptureAttempt BuildDdaAttempt(bool audio)
+    private CaptureAttempt BuildDdaAttempt()
     {
-        var segmentPath = Path.Combine(AppPaths.BufferFolder, "seg_%Y%m%d_%H%M%S.mkv");
+        var segmentPath = Path.Combine(AppPaths.BufferFolder, "seg_%Y%m%d_%H%M%S.ts");
         var mouse = _settings.DrawMouse ? "1" : "0";
         var videoInput = $"-f lavfi -i \"ddagrab=framerate={Fps}:output_idx=0:draw_mouse={mouse}\"";
-        var audioInput = audio ? "-thread_queue_size 4096 -f wasapi -loopback 1 -i default" : "";
-        var map = audio ? "-map 0:v:0 -map 1:a:0" : "-map 0:v:0 -an";
-        var audioArgs = audio ? "-c:a aac -b:a 192k -ar 48000 -ac 2" : "";
 
-        var args = $"-hide_banner -loglevel warning {videoInput} {audioInput} {map} " +
-                   $"-c:v h264_nvenc -preset p5 -tune hq -rc vbr -cq 23 -b:v {BitrateMbps}M -maxrate {BitrateMbps * 2}M -bufsize {BitrateMbps * 4}M " +
-                   $"-g {Fps} -force_key_frames \"expr:gte(t,n_forced*1)\" {audioArgs} " +
-                   $"-f segment -segment_time 1 -segment_format matroska -reset_timestamps 1 -strftime 1 \"{segmentPath}\"";
+        var args = $"-hide_banner -loglevel warning {videoInput} -map 0:v:0 -an " +
+                   $"-c:v h264_nvenc -preset p5 -rc vbr -cq 23 -b:v {BitrateMbps}M -maxrate {BitrateMbps * 2}M -bufsize {BitrateMbps * 4}M " +
+                   $"-g {Fps} -force_key_frames \"expr:gte(t,n_forced*1)\" " +
+                   $"-f segment -segment_time 1 -segment_format mpegts -reset_timestamps 1 -strftime 1 \"{segmentPath}\"";
 
-        return new CaptureAttempt(audio ? "고성능 DDA + 시스템 소리" : "고성능 DDA", args);
+        return new CaptureAttempt("고성능 DDA", args);
     }
 
-    private CaptureAttempt BuildGdiAttempt(bool audio)
+    private CaptureAttempt BuildGdiAttempt()
     {
-        var segmentPath = Path.Combine(AppPaths.BufferFolder, "seg_%Y%m%d_%H%M%S.mkv");
+        var segmentPath = Path.Combine(AppPaths.BufferFolder, "seg_%Y%m%d_%H%M%S.ts");
         var mouse = _settings.DrawMouse ? "1" : "0";
         var videoInput = $"-f gdigrab -framerate {Fps} -draw_mouse {mouse} -i desktop";
-        var audioInput = audio ? "-thread_queue_size 4096 -f wasapi -loopback 1 -i default" : "";
-        var map = audio ? "-map 0:v:0 -map 1:a:0" : "-map 0:v:0 -an";
-        var audioArgs = audio ? "-c:a aac -b:a 192k -ar 48000 -ac 2" : "";
 
-        var args = $"-hide_banner -loglevel warning {videoInput} {audioInput} {map} " +
-                   $"-c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -b:v {BitrateMbps}M " +
-                   $"-g {Fps} -force_key_frames \"expr:gte(t,n_forced*1)\" {audioArgs} " +
-                   $"-f segment -segment_time 1 -segment_format matroska -reset_timestamps 1 -strftime 1 \"{segmentPath}\"";
+        var args = $"-hide_banner -loglevel warning {videoInput} -map 0:v:0 -an " +
+                   $"-c:v libx264 -preset ultrafast -crf 23 -pix_fmt yuv420p -b:v {BitrateMbps}M " +
+                   $"-g {Fps} -force_key_frames \"expr:gte(t,n_forced*1)\" " +
+                   $"-f segment -segment_time 1 -segment_format mpegts -reset_timestamps 1 -strftime 1 \"{segmentPath}\"";
 
-        return new CaptureAttempt(audio ? "호환 GDI + 시스템 소리" : "호환 GDI", args);
+        return new CaptureAttempt("호환 GDI", args);
+    }
+
+    private void StartAudioCaptureIfNeeded()
+    {
+        StopAudioCapture();
+
+        if (!_settings.IncludeAudio)
+        {
+            return;
+        }
+
+        try
+        {
+            lock (_audioLock)
+            {
+                _audioRing.Clear();
+                _audioBytesCaptured = 0;
+            }
+
+            _audioCapture = new WasapiLoopbackCapture();
+            _audioFormat = _audioCapture.WaveFormat;
+            _audioCapture.DataAvailable += OnAudioDataAvailable;
+            _audioCapture.RecordingStopped += (_, e) =>
+            {
+                _audioRunning = false;
+                if (e.Exception != null)
+                {
+                    SafeUi(() => Log("시스템 소리 녹음 중단: " + e.Exception.Message));
+                }
+            };
+            _audioCapture.StartRecording();
+            _audioRunning = true;
+            Log("시스템 소리 녹음이 시작되었습니다.");
+        }
+        catch (Exception ex)
+        {
+            _audioRunning = false;
+            Log("시스템 소리 녹음 시작 실패: " + ex.Message);
+        }
+    }
+
+    private void StopAudioCapture()
+    {
+        try
+        {
+            if (_audioCapture != null)
+            {
+                _audioCapture.DataAvailable -= OnAudioDataAvailable;
+                _audioCapture.StopRecording();
+                _audioCapture.Dispose();
+                _audioCapture = null;
+            }
+        }
+        catch
+        {
+        }
+
+        _audioRunning = false;
+    }
+
+    private void OnAudioDataAvailable(object? sender, WaveInEventArgs e)
+    {
+        if (e.BytesRecorded <= 0)
+        {
+            return;
+        }
+
+        lock (_audioLock)
+        {
+            for (var i = 0; i < e.BytesRecorded; i++)
+            {
+                _audioRing.Add(e.Buffer[i]);
+            }
+
+            _audioBytesCaptured += e.BytesRecorded;
+
+            var averageBytesPerSecond = Math.Max(1, _audioFormat?.AverageBytesPerSecond ?? 192000);
+            var maxBytes = averageBytesPerSecond * (BufferSeconds + 8);
+            if (_audioRing.Count > maxBytes)
+            {
+                _audioRing.RemoveRange(0, _audioRing.Count - maxBytes);
+            }
+        }
+    }
+
+    private async Task<bool> WriteRecentAudioFileAsync(string path, int seconds)
+    {
+        byte[] audioBytes;
+        WaveFormat? format;
+
+        lock (_audioLock)
+        {
+            format = _audioFormat;
+            if (format == null || _audioRing.Count == 0)
+            {
+                return false;
+            }
+
+            var bytesToTake = Math.Min(_audioRing.Count, format.AverageBytesPerSecond * Math.Max(1, seconds));
+            audioBytes = _audioRing.Skip(_audioRing.Count - bytesToTake).ToArray();
+        }
+
+        if (audioBytes.Length < 1024)
+        {
+            return false;
+        }
+
+        await Task.Run(() =>
+        {
+            using var writer = new WaveFileWriter(path, format);
+            writer.Write(audioBytes, 0, audioBytes.Length);
+        });
+
+        return File.Exists(path) && new FileInfo(path).Length > 1024;
     }
 
     private async Task SaveClipAsync(string reason)
@@ -857,31 +982,44 @@ internal sealed class MainForm : Form
         _saveButton.Enabled = false;
         _statusLabel.Text = "클립 저장 중";
 
+        var seconds = Math.Min(BufferSeconds, segments.Count);
         var workFolder = Path.Combine(AppPaths.LocalAppDataFolder, "clipwork", Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(workFolder);
-        var listPath = Path.Combine(workFolder, "segments.txt");
+
+        var joinedTsPath = Path.Combine(workFolder, "joined.ts");
+        var tempVideoPath = Path.Combine(workFolder, "video.mp4");
+        var tempAudioPath = Path.Combine(workFolder, "audio.wav");
         var outputPath = Path.Combine(_settings.OutputFolder, $"ShotLog_{DateTime.Now:yyyy-MM-dd_HH-mm-ss}_{reason}.mp4");
 
         try
         {
-            await File.WriteAllLinesAsync(listPath, segments.Select(path => "file '" + EscapeConcatPath(path) + "'"), Encoding.UTF8);
-            var ffmpegPath = EnsureFfmpeg();
+            await JoinTransportStreamFilesAsync(segments, joinedTsPath);
 
-            var copyArgs = $"-hide_banner -loglevel warning -y -f concat -safe 0 -i \"{listPath}\" -c copy -movflags +faststart \"{outputPath}\"";
+            if (!File.Exists(joinedTsPath) || new FileInfo(joinedTsPath).Length < 1024 * 100)
+            {
+                Log("클립 저장 실패: 임시 영상 조각이 너무 작거나 비어 있습니다.");
+                return;
+            }
+
+            var ffmpegPath = EnsureFfmpeg();
+            Log($"클립 생성 중: {segments.Count}개 조각 / 약 {seconds}초");
+
+            var copyArgs = $"-hide_banner -loglevel warning -y -fflags +genpts -i \"{joinedTsPath}\" -map 0:v:0 -c:v copy -an -movflags +faststart \"{tempVideoPath}\"";
             var copyResult = await RunProcessAsync(ffmpegPath, copyArgs);
 
-            if (copyResult.ExitCode != 0)
+            if (copyResult.ExitCode != 0 || !File.Exists(tempVideoPath) || new FileInfo(tempVideoPath).Length < 1024)
             {
-                Log("빠른 저장 실패, 재인코딩으로 다시 저장합니다.");
-                var reencodeArgs = $"-hide_banner -loglevel warning -y -f concat -safe 0 -i \"{listPath}\" -c:v h264_nvenc -preset p5 -cq 23 -b:v {BitrateMbps}M -c:a aac -b:a 192k -movflags +faststart \"{outputPath}\"";
+                Log("빠른 저장 실패, 재인코딩으로 다시 저장합니다: " + LastLine(copyResult.ErrorText));
+                var reencodeArgs = $"-hide_banner -loglevel warning -y -fflags +genpts -i \"{joinedTsPath}\" -map 0:v:0 -c:v h264_nvenc -preset p5 -cq 23 -b:v {BitrateMbps}M -an -movflags +faststart \"{tempVideoPath}\"";
                 var reencodeResult = await RunProcessAsync(ffmpegPath, reencodeArgs);
 
-                if (reencodeResult.ExitCode != 0)
+                if (reencodeResult.ExitCode != 0 || !File.Exists(tempVideoPath) || new FileInfo(tempVideoPath).Length < 1024)
                 {
-                    var x264Args = $"-hide_banner -loglevel warning -y -f concat -safe 0 -i \"{listPath}\" -c:v libx264 -preset veryfast -crf 23 -c:a aac -b:a 192k -movflags +faststart \"{outputPath}\"";
+                    Log("NVENC 재인코딩 실패, CPU 인코딩으로 다시 저장합니다: " + LastLine(reencodeResult.ErrorText));
+                    var x264Args = $"-hide_banner -loglevel warning -y -fflags +genpts -i \"{joinedTsPath}\" -map 0:v:0 -c:v libx264 -preset veryfast -crf 23 -an -movflags +faststart \"{tempVideoPath}\"";
                     var x264Result = await RunProcessAsync(ffmpegPath, x264Args);
 
-                    if (x264Result.ExitCode != 0)
+                    if (x264Result.ExitCode != 0 || !File.Exists(tempVideoPath) || new FileInfo(tempVideoPath).Length < 1024)
                     {
                         Log("클립 저장 실패: " + LastLine(x264Result.ErrorText));
                         return;
@@ -889,8 +1027,25 @@ internal sealed class MainForm : Form
                 }
             }
 
-            var seconds = segments.Count;
-            Log($"클립 저장 완료: 약 {seconds}초 / {Path.GetFileName(outputPath)}");
+            var audioAdded = false;
+            if (_settings.IncludeAudio && await WriteRecentAudioFileAsync(tempAudioPath, seconds))
+            {
+                var muxArgs = $"-hide_banner -loglevel warning -y -i \"{tempVideoPath}\" -i \"{tempAudioPath}\" -map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -b:a 192k -shortest -movflags +faststart \"{outputPath}\"";
+                var muxResult = await RunProcessAsync(ffmpegPath, muxArgs);
+                audioAdded = muxResult.ExitCode == 0 && File.Exists(outputPath) && new FileInfo(outputPath).Length > 1024;
+
+                if (!audioAdded)
+                {
+                    Log("소리 병합 실패, 영상만 저장합니다: " + LastLine(muxResult.ErrorText));
+                }
+            }
+
+            if (!audioAdded)
+            {
+                File.Copy(tempVideoPath, outputPath, true);
+            }
+
+            Log($"클립 저장 완료: 약 {seconds}초 / {(audioAdded ? "소리 포함" : "영상만")} / {Path.GetFileName(outputPath)}");
         }
         catch (Exception ex)
         {
@@ -912,12 +1067,31 @@ internal sealed class MainForm : Form
         }
     }
 
+
+    private static async Task JoinTransportStreamFilesAsync(List<string> segments, string outputPath)
+    {
+        await using var output = new FileStream(outputPath, FileMode.Create, FileAccess.Write, FileShare.Read);
+
+        foreach (var segment in segments)
+        {
+            try
+            {
+                await using var input = new FileStream(segment, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                await input.CopyToAsync(output);
+            }
+            catch
+            {
+            }
+        }
+    }
+
     private void UpdateBufferState()
     {
         CleanBufferFolder(false);
         var count = GetCompletedSegments().Count;
         var available = Math.Min(BufferSeconds, count);
-        _availableLabel.Text = $"저장 가능 영상 : {available}초 / {BufferSeconds}초 ({count}개 조각)";
+        var audioStatus = _settings.IncludeAudio ? (_audioRunning ? " / 시스템 소리 녹음 중" : " / 시스템 소리 대기") : "";
+        _availableLabel.Text = $"저장 가능 영상 : {available}초 / {BufferSeconds}초 ({count}개 조각){audioStatus}";
         _toggleRecordButton.Text = _recording ? "상시녹화 중지" : "상시녹화 시작";
         _engineLabel.Text = "캡처 엔진 : " + _activeEngineName;
     }
@@ -930,9 +1104,9 @@ internal sealed class MainForm : Form
         }
 
         var now = DateTime.Now;
-        return Directory.GetFiles(AppPaths.BufferFolder, "seg_*.mkv")
+        return Directory.GetFiles(AppPaths.BufferFolder, "seg_*.ts")
             .Select(path => new FileInfo(path))
-            .Where(file => file.Exists && file.Length > 1024 * 50 && (now - file.LastWriteTime).TotalMilliseconds > 1400)
+            .Where(file => file.Exists && file.Length > 1024 * 100 && (now - file.LastWriteTime).TotalMilliseconds > 2200)
             .OrderBy(file => file.LastWriteTimeUtc)
             .Select(file => file.FullName)
             .ToList();
@@ -946,7 +1120,7 @@ internal sealed class MainForm : Form
         }
 
         var cutoff = DateTime.Now.AddSeconds(-(BufferSeconds + 12));
-        foreach (var file in Directory.GetFiles(AppPaths.BufferFolder, "seg_*.mkv"))
+        foreach (var file in Directory.GetFiles(AppPaths.BufferFolder, "seg_*.ts"))
         {
             try
             {
@@ -1467,7 +1641,7 @@ internal sealed class AppSettings
     public bool HotkeyAlt { get; set; } = false;
     public bool HotkeyShift { get; set; } = false;
     public bool CheckUpdatesOnStart { get; set; } = true;
-    public string GitHubOwner { get; set; } = "angae1423";
+    public string GitHubOwner { get; set; } = "nyexgs";
     public string GitHubRepo { get; set; } = "ShotLog";
 
     public void Normalize()
