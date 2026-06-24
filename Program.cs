@@ -100,17 +100,47 @@ internal sealed class MainForm : Form
 {
     private const int HotKeyId = 9001;
     private const int WmHotKey = 0x0312;
+    private const int WhKeyboardLl = 13;
+    private const int WmKeyDown = 0x0100;
+    private const int WmSysKeyDown = 0x0104;
     private const int ModAlt = 0x0001;
     private const int ModControl = 0x0002;
     private const int ModShift = 0x0004;
     private const int ModNoRepeat = 0x4000;
     private const int AudioDelayBaseMs = 3500;
 
+    private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
+
     [DllImport("user32.dll")]
     private static extern bool RegisterHotKey(IntPtr hWnd, int id, int fsModifiers, int vk);
 
     [DllImport("user32.dll")]
     private static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelKeyboardProc lpfn, IntPtr hMod, uint dwThreadId);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool UnhookWindowsHookEx(IntPtr hhk);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    private static extern short GetAsyncKeyState(int vKey);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+    private static extern IntPtr GetModuleHandle(string? lpModuleName);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct KbdLlHookStruct
+    {
+        public int VkCode;
+        public int ScanCode;
+        public int Flags;
+        public int Time;
+        public IntPtr ExtraInfo;
+    }
 
     private readonly AppSettings _settings;
     private readonly JsonSerializerOptions _jsonOptions = new() { WriteIndented = true };
@@ -150,7 +180,7 @@ internal sealed class MainForm : Form
     private readonly Button _saveButton = new();
     private readonly Button _openFolderButton = new();
     private readonly Button _setFolderButton = new();
-    private readonly Button _applyHotkeyButton = new();
+    private readonly Button _recordHotkeyButton = new();
     private readonly TextBox _githubOwnerBox = new();
     private readonly TextBox _githubRepoBox = new();
     private readonly CheckBox _checkUpdatesOnStartCheck = new();
@@ -162,6 +192,10 @@ internal sealed class MainForm : Form
     private bool _saving;
     private bool _exitRequested;
     private bool _hotkeyRegistered;
+    private IntPtr _keyboardHookHandle = IntPtr.Zero;
+    private LowLevelKeyboardProc? _keyboardHookProc;
+    private bool _recordingHotkey;
+    private DateTime _lastHotkeyTriggeredAt = DateTime.MinValue;
     private bool _manualStopping;
     private DateTime _recordingStartedAt;
     private string _activeEngineName = "대기 중";
@@ -469,38 +503,26 @@ internal sealed class MainForm : Form
         });
 
         var hotkeyBox = CreateGroupBox("단축키 설정", 22, 542, 370, 112);
-        _ctrlCheck.Text = "Ctrl";
-        _ctrlCheck.Left = 18;
-        _ctrlCheck.Top = 32;
-        _ctrlCheck.Width = 60;
-        _ctrlCheck.ForeColor = Color.White;
+        AddLabel(hotkeyBox, "현재 단축키", 18, 32, 100);
 
-        _altCheck.Text = "Alt";
-        _altCheck.Left = 82;
-        _altCheck.Top = 32;
-        _altCheck.Width = 55;
-        _altCheck.ForeColor = Color.White;
+        var hotkeyPreviewLabel = new Label
+        {
+            Left = 120,
+            Top = 32,
+            Width = 220,
+            Height = 24,
+            ForeColor = Color.FromArgb(220, 220, 230)
+        };
+        hotkeyPreviewLabel.DataBindings.Add("Text", _hotkeyInfoLabel, "Text");
 
-        _shiftCheck.Text = "Shift";
-        _shiftCheck.Left = 140;
-        _shiftCheck.Top = 32;
-        _shiftCheck.Width = 70;
-        _shiftCheck.ForeColor = Color.White;
+        _recordHotkeyButton.Text = "단축키 녹화";
+        _recordHotkeyButton.Left = 18;
+        _recordHotkeyButton.Top = 68;
+        _recordHotkeyButton.Width = 322;
+        _recordHotkeyButton.Height = 30;
+        _recordHotkeyButton.Click += (_, _) => BeginHotkeyRecording();
 
-        _hotkeyCombo.Left = 220;
-        _hotkeyCombo.Top = 29;
-        _hotkeyCombo.Width = 120;
-        _hotkeyCombo.DropDownStyle = ComboBoxStyle.DropDownList;
-        _hotkeyCombo.Items.AddRange(new object[] { "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12", "Insert", "Home", "End", "PageUp", "PageDown" });
-
-        _applyHotkeyButton.Text = "단축키 적용";
-        _applyHotkeyButton.Left = 18;
-        _applyHotkeyButton.Top = 68;
-        _applyHotkeyButton.Width = 322;
-        _applyHotkeyButton.Height = 30;
-        _applyHotkeyButton.Click += (_, _) => ApplyHotkey(true);
-
-        hotkeyBox.Controls.AddRange(new Control[] { _ctrlCheck, _altCheck, _shiftCheck, _hotkeyCombo, _applyHotkeyButton });
+        hotkeyBox.Controls.AddRange(new Control[] { hotkeyPreviewLabel, _recordHotkeyButton });
 
         var folderBox = CreateGroupBox("저장 폴더", 410, 542, 370, 112);
         _folderLabel.Text = "";
@@ -656,15 +678,6 @@ internal sealed class MainForm : Form
         _bitrateInput.Value = Clamp(_settings.BitrateMbps, 5, 80);
         _audioCheck.Checked = _settings.IncludeAudio;
         _mouseCheck.Checked = _settings.DrawMouse;
-        _ctrlCheck.Checked = _settings.HotkeyCtrl;
-        _altCheck.Checked = _settings.HotkeyAlt;
-        _shiftCheck.Checked = _settings.HotkeyShift;
-        _hotkeyCombo.SelectedItem = _settings.HotkeyKey;
-        if (_hotkeyCombo.SelectedIndex < 0)
-        {
-            _hotkeyCombo.SelectedItem = "F8";
-        }
-
         _engineCombo.SelectedIndex = _settings.CaptureMode switch
         {
             "dda" => 1,
@@ -693,10 +706,6 @@ internal sealed class MainForm : Form
         _settings.AudioDelayMs = (int)_audioDelayInput.Value;
         _settings.MicVolumePercent = (int)_micVolumeInput.Value;
         _settings.DrawMouse = _mouseCheck.Checked;
-        _settings.HotkeyCtrl = _ctrlCheck.Checked;
-        _settings.HotkeyAlt = _altCheck.Checked;
-        _settings.HotkeyShift = _shiftCheck.Checked;
-        _settings.HotkeyKey = Convert.ToString(_hotkeyCombo.SelectedItem) ?? "F8";
         _settings.CaptureMode = _engineCombo.SelectedIndex switch
         {
             1 => "dda",
@@ -1781,18 +1790,32 @@ del "%~f0" > nul 2>nul
         SaveUiSettings();
         UnregisterCurrentHotkey();
 
-        var vk = HotkeyToVirtualKey(_settings.HotkeyKey);
-        var modifiers = ModNoRepeat;
-        if (_settings.HotkeyCtrl) modifiers |= ModControl;
-        if (_settings.HotkeyAlt) modifiers |= ModAlt;
-        if (_settings.HotkeyShift) modifiers |= ModShift;
+        _keyboardHookProc = KeyboardHookCallback;
+        var moduleHandle = IntPtr.Zero;
 
-        _hotkeyRegistered = RegisterHotKey(Handle, HotKeyId, modifiers, vk);
+        try
+        {
+            using var currentProcess = Process.GetCurrentProcess();
+            using var currentModule = currentProcess.MainModule;
+            moduleHandle = GetModuleHandle(currentModule?.ModuleName);
+        }
+        catch
+        {
+            moduleHandle = IntPtr.Zero;
+        }
+
+        _keyboardHookHandle = SetWindowsHookEx(WhKeyboardLl, _keyboardHookProc, moduleHandle, 0);
+        if (_keyboardHookHandle == IntPtr.Zero && moduleHandle != IntPtr.Zero)
+        {
+            _keyboardHookHandle = SetWindowsHookEx(WhKeyboardLl, _keyboardHookProc, IntPtr.Zero, 0);
+        }
+
+        _hotkeyRegistered = _keyboardHookHandle != IntPtr.Zero;
         UpdateHotkeyLabel();
 
         if (!_hotkeyRegistered)
         {
-            Log("단축키 등록에 실패했습니다. 다른 프로그램이 같은 단축키를 사용 중일 수 있습니다.");
+            Log("단축키 감지 등록에 실패했습니다. 관리자 권한으로 실행하면 해결될 수 있습니다.");
         }
         else if (showMessage)
         {
@@ -1802,11 +1825,97 @@ del "%~f0" > nul 2>nul
 
     private void UnregisterCurrentHotkey()
     {
-        if (_hotkeyRegistered)
+        if (_keyboardHookHandle != IntPtr.Zero)
         {
-            UnregisterHotKey(Handle, HotKeyId);
-            _hotkeyRegistered = false;
+            UnhookWindowsHookEx(_keyboardHookHandle);
+            _keyboardHookHandle = IntPtr.Zero;
         }
+
+        _keyboardHookProc = null;
+        _hotkeyRegistered = false;
+    }
+
+    private void BeginHotkeyRecording()
+    {
+        if (!_hotkeyRegistered)
+        {
+            ApplyHotkey(false);
+        }
+
+        _recordingHotkey = true;
+        _recordHotkeyButton.Text = "입력 대기 중... (Esc 취소)";
+        Log("새 단축키를 입력하세요. 예: C, Ctrl + J, Alt + C");
+    }
+
+    private void CancelHotkeyRecording()
+    {
+        _recordingHotkey = false;
+        _recordHotkeyButton.Text = "단축키 녹화";
+        Log("단축키 녹화를 취소했습니다.");
+    }
+
+    private void CompleteHotkeyRecording(Keys key, bool ctrl, bool alt, bool shift)
+    {
+        _settings.HotkeyCtrl = ctrl;
+        _settings.HotkeyAlt = alt;
+        _settings.HotkeyShift = shift;
+        _settings.HotkeyKey = KeyToSettingsName(key);
+        _recordingHotkey = false;
+        _recordHotkeyButton.Text = "단축키 녹화";
+        SaveSettings();
+        UpdateHotkeyLabel();
+        Log("단축키를 적용했습니다: " + GetHotkeyDisplay());
+    }
+
+    private IntPtr KeyboardHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
+    {
+        if (nCode >= 0 && (wParam == (IntPtr)WmKeyDown || wParam == (IntPtr)WmSysKeyDown))
+        {
+            var hookData = Marshal.PtrToStructure<KbdLlHookStruct>(lParam);
+            var key = (Keys)hookData.VkCode;
+
+            if (_recordingHotkey)
+            {
+                if (key == Keys.Escape)
+                {
+                    SafeUi(CancelHotkeyRecording);
+                }
+                else if (!IsModifierKey(key))
+                {
+                    var ctrl = IsCtrlPressed();
+                    var alt = IsAltPressed();
+                    var shift = IsShiftPressed();
+                    SafeUi(() => CompleteHotkeyRecording(key, ctrl, alt, shift));
+                }
+
+                return CallNextHookEx(_keyboardHookHandle, nCode, wParam, lParam);
+            }
+
+            if (IsConfiguredHotkeyPressed(key))
+            {
+                var now = DateTime.UtcNow;
+                if ((now - _lastHotkeyTriggeredAt).TotalMilliseconds >= 700)
+                {
+                    _lastHotkeyTriggeredAt = now;
+                    SafeUi(() => _ = SaveClipAsync("hotkey"));
+                }
+            }
+        }
+
+        return CallNextHookEx(_keyboardHookHandle, nCode, wParam, lParam);
+    }
+
+    private bool IsConfiguredHotkeyPressed(Keys pressedKey)
+    {
+        var targetKey = SettingsNameToKey(_settings.HotkeyKey);
+        if (targetKey == Keys.None || pressedKey != targetKey)
+        {
+            return false;
+        }
+
+        return IsCtrlPressed() == _settings.HotkeyCtrl
+            && IsAltPressed() == _settings.HotkeyAlt
+            && IsShiftPressed() == _settings.HotkeyShift;
     }
 
     private void UpdateHotkeyLabel()
@@ -1820,21 +1929,103 @@ del "%~f0" > nul 2>nul
         if (_settings.HotkeyCtrl) parts.Add("Ctrl");
         if (_settings.HotkeyAlt) parts.Add("Alt");
         if (_settings.HotkeyShift) parts.Add("Shift");
-        parts.Add(_settings.HotkeyKey);
+        parts.Add(KeyToDisplayName(_settings.HotkeyKey));
         return string.Join(" + ", parts);
     }
 
-    private static int HotkeyToVirtualKey(string key)
+    private static bool IsModifierKey(Keys key)
     {
-        return key switch
+        return key is Keys.ControlKey or Keys.LControlKey or Keys.RControlKey
+            or Keys.Menu or Keys.LMenu or Keys.RMenu
+            or Keys.ShiftKey or Keys.LShiftKey or Keys.RShiftKey;
+    }
+
+    private static bool IsCtrlPressed()
+    {
+        return IsVirtualKeyDown(Keys.ControlKey) || IsVirtualKeyDown(Keys.LControlKey) || IsVirtualKeyDown(Keys.RControlKey);
+    }
+
+    private static bool IsAltPressed()
+    {
+        return IsVirtualKeyDown(Keys.Menu) || IsVirtualKeyDown(Keys.LMenu) || IsVirtualKeyDown(Keys.RMenu);
+    }
+
+    private static bool IsShiftPressed()
+    {
+        return IsVirtualKeyDown(Keys.ShiftKey) || IsVirtualKeyDown(Keys.LShiftKey) || IsVirtualKeyDown(Keys.RShiftKey);
+    }
+
+    private static bool IsVirtualKeyDown(Keys key)
+    {
+        return (GetAsyncKeyState((int)key) & unchecked((short)0x8000)) != 0;
+    }
+
+    private static string KeyToSettingsName(Keys key)
+    {
+        if ((int)key >= (int)Keys.A && (int)key <= (int)Keys.Z)
         {
-            "Insert" => 0x2D,
-            "Home" => 0x24,
-            "End" => 0x23,
-            "PageUp" => 0x21,
-            "PageDown" => 0x22,
-            _ when Regex.IsMatch(key, @"^F\d{1,2}$") => 0x70 + int.Parse(key[1..]) - 1,
-            _ => 0x77
+            return key.ToString();
+        }
+
+        if ((int)key >= (int)Keys.D0 && (int)key <= (int)Keys.D9)
+        {
+            return ((int)key - (int)Keys.D0).ToString();
+        }
+
+        return key.ToString();
+    }
+
+    private static Keys SettingsNameToKey(string key)
+    {
+        if (string.IsNullOrWhiteSpace(key))
+        {
+            return Keys.F8;
+        }
+
+        key = key.Trim();
+
+        if (key.Length == 1 && key[0] is >= 'A' and <= 'Z')
+        {
+            return Enum.TryParse<Keys>(key, true, out var letterKey) ? letterKey : Keys.None;
+        }
+
+        if (key.Length == 1 && char.IsDigit(key[0]))
+        {
+            return (Keys)((int)Keys.D0 + key[0] - '0');
+        }
+
+        return Enum.TryParse<Keys>(key, true, out var parsed) ? parsed : Keys.None;
+    }
+
+    private static string KeyToDisplayName(string key)
+    {
+        var parsed = SettingsNameToKey(key);
+        return parsed switch
+        {
+            Keys.D0 => "0",
+            Keys.D1 => "1",
+            Keys.D2 => "2",
+            Keys.D3 => "3",
+            Keys.D4 => "4",
+            Keys.D5 => "5",
+            Keys.D6 => "6",
+            Keys.D7 => "7",
+            Keys.D8 => "8",
+            Keys.D9 => "9",
+            Keys.Space => "Space",
+            Keys.Oemtilde => "`",
+            Keys.OemMinus => "-",
+            Keys.Oemplus => "=",
+            Keys.OemOpenBrackets => "[",
+            Keys.OemCloseBrackets => "]",
+            Keys.OemPipe => "\\",
+            Keys.OemSemicolon => ";",
+            Keys.OemQuotes => "'",
+            Keys.Oemcomma => ",",
+            Keys.OemPeriod => ".",
+            Keys.OemQuestion => "/",
+            Keys.None => "F8",
+            _ => parsed.ToString()
         };
     }
 
