@@ -1,0 +1,42 @@
+name: Build and Release ShotLog
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Restore
+        run: dotnet restore ShotLog.csproj
+
+      - name: Publish ShotLog
+        run: dotnet publish ShotLog.csproj -c Release -r win-x64 --self-contained true /p:PublishSingleFile=true /p:EnableCompressionInSingleFile=true
+
+      - name: Create ZIP package
+        shell: pwsh
+        run: |
+          $publish = "bin\Release\net8.0-windows\win-x64\publish"
+          Compress-Archive -Path "$publish\ShotLog.exe" -DestinationPath "$publish\ShotLog.zip" -Force
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            bin/Release/net8.0-windows/win-x64/publish/ShotLog.exe
+            bin/Release/net8.0-windows/win-x64/publish/ShotLog.zip
+          generate_release_notes: true

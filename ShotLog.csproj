@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>ShotLog</AssemblyName>
+    <RootNamespace>ShotLog</RootNamespace>
+    <ApplicationIcon>ShotLog.ico</ApplicationIcon>
+    <Version>0.10.0</Version>
+    <FileVersion>0.10.0.0</FileVersion>
+    <AssemblyVersion>0.10.0.0</AssemblyVersion>
+    <InformationalVersion>0.10.0</InformationalVersion>
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>true</SelfContained>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="ffmpeg.exe" LogicalName="ffmpeg.exe" Condition="Exists('ffmpeg.exe')" />
+    <EmbeddedResource Include="ShotLog.ico" LogicalName="ShotLog.ico" Condition="Exists('ShotLog.ico')" />
+    <EmbeddedResource Include="ShotLog.png" LogicalName="ShotLog.png" Condition="Exists('ShotLog.png')" />
+  </ItemGroup>
+</Project>
