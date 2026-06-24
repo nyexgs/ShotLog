@@ -8,10 +8,10 @@
     <AssemblyName>ShotLog</AssemblyName>
     <RootNamespace>ShotLog</RootNamespace>
     <ApplicationIcon>ShotLog.ico</ApplicationIcon>
-    <Version>0.13.0</Version>
-    <FileVersion>0.13.0.0</FileVersion>
-    <AssemblyVersion>0.13.0.0</AssemblyVersion>
-    <InformationalVersion>0.13.0</InformationalVersion>
+    <Version>0.5.0</Version>
+    <FileVersion>0.5.0.0</FileVersion>
+    <AssemblyVersion>0.5.0.0</AssemblyVersion>
+    <InformationalVersion>0.5.0</InformationalVersion>
     <PublishSingleFile>true</PublishSingleFile>
     <SelfContained>true</SelfContained>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>

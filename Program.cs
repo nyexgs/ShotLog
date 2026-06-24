@@ -10,6 +10,7 @@ using System.Text.RegularExpressions;
 using Microsoft.Win32;
 using NAudio.CoreAudioApi;
 using NAudio.Wave;
+using NAudio.Wave.SampleProviders;
 using Timer = System.Windows.Forms.Timer;
 
 namespace ShotLog;
@@ -29,7 +30,7 @@ internal static class Program
             return version;
         }
 
-        return assembly.GetName().Version ?? new Version(0, 12, 0);
+        return assembly.GetName().Version ?? new Version(0, 5, 0);
     }
 
     [STAThread]
@@ -103,6 +104,7 @@ internal sealed class MainForm : Form
     private const int ModControl = 0x0002;
     private const int ModShift = 0x0004;
     private const int ModNoRepeat = 0x4000;
+    private const int AudioDelayBaseMs = 3500;
 
     [DllImport("user32.dll")]
     private static extern bool RegisterHotKey(IntPtr hWnd, int id, int fsModifiers, int vk);
@@ -140,6 +142,8 @@ internal sealed class MainForm : Form
     private readonly CheckedListBox _outputDeviceList = new();
     private readonly CheckedListBox _micDeviceList = new();
     private readonly NumericUpDown _audioDelayInput = new();
+    private readonly NumericUpDown _micVolumeInput = new();
+    private readonly Button _micTestButton = new();
     private readonly Button _refreshAudioDevicesButton = new();
     private readonly CheckBox _mouseCheck = new();
     private readonly Button _toggleRecordButton = new();
@@ -165,9 +169,11 @@ internal sealed class MainForm : Form
     private bool _forceGdiUntilManualStart;
 
     private readonly List<AudioCaptureSession> _audioSessions = new();
+    private readonly List<MicMonitorSession> _micMonitorSessions = new();
     private readonly List<AudioDeviceItem> _outputDevices = new();
     private readonly List<AudioDeviceItem> _micDevices = new();
     private bool _audioRunning;
+    private bool _micTestRunning;
 
     private int BufferSeconds => (int)_secondsInput.Value;
     private int Fps => (int)_fpsInput.Value;
@@ -184,9 +190,9 @@ internal sealed class MainForm : Form
 
         Text = "ShotLog";
         Width = 820;
-        Height = 900;
+        Height = 940;
         StartPosition = FormStartPosition.CenterScreen;
-        MinimumSize = new Size(820, 900);
+        MinimumSize = new Size(820, 940);
         BackColor = Color.FromArgb(18, 19, 25);
         ForeColor = Color.White;
         Icon = _formIcon;
@@ -243,6 +249,7 @@ internal sealed class MainForm : Form
     protected override void OnFormClosed(FormClosedEventArgs e)
     {
         _bufferTimer.Stop();
+        StopMicTest();
         StopRecording(false);
         UnregisterCurrentHotkey();
         _notifyIcon.Visible = false;
@@ -407,7 +414,7 @@ internal sealed class MainForm : Form
             _toggleRecordButton, _saveButton, _availableLabel
         });
 
-        var audioBox = CreateGroupBox("오디오 설정", 22, 316, 758, 170);
+        var audioBox = CreateGroupBox("오디오 설정", 22, 316, 758, 210);
         AddLabel(audioBox, "출력 장치", 18, 30, 80);
         _outputDeviceList.Left = 18;
         _outputDeviceList.Top = 54;
@@ -430,23 +437,38 @@ internal sealed class MainForm : Form
         _audioDelayInput.Left = 154;
         _audioDelayInput.Top = 134;
         _audioDelayInput.Width = 90;
-        _audioDelayInput.Minimum = 0;
+        _audioDelayInput.Minimum = -3500;
         _audioDelayInput.Maximum = 5000;
         _audioDelayInput.Increment = 100;
 
+        AddLabel(audioBox, "마이크 볼륨(%)", 270, 138, 100);
+        _micVolumeInput.Left = 382;
+        _micVolumeInput.Top = 134;
+        _micVolumeInput.Width = 90;
+        _micVolumeInput.Minimum = 50;
+        _micVolumeInput.Maximum = 500;
+        _micVolumeInput.Increment = 10;
+
+        _micTestButton.Text = "마이크 테스트 시작";
+        _micTestButton.Left = 18;
+        _micTestButton.Top = 170;
+        _micTestButton.Width = 220;
+        _micTestButton.Height = 30;
+        _micTestButton.Click += (_, _) => ToggleMicTest();
+
         _refreshAudioDevicesButton.Text = "오디오 장치 새로고침";
         _refreshAudioDevicesButton.Left = 382;
-        _refreshAudioDevicesButton.Top = 132;
+        _refreshAudioDevicesButton.Top = 170;
         _refreshAudioDevicesButton.Width = 340;
         _refreshAudioDevicesButton.Height = 30;
         _refreshAudioDevicesButton.Click += (_, _) => LoadAudioDevicesToUi(true);
 
         audioBox.Controls.AddRange(new Control[]
         {
-            _outputDeviceList, _micDeviceList, _audioDelayInput, _refreshAudioDevicesButton
+            _outputDeviceList, _micDeviceList, _audioDelayInput, _micVolumeInput, _micTestButton, _refreshAudioDevicesButton
         });
 
-        var hotkeyBox = CreateGroupBox("단축키 설정", 22, 502, 370, 112);
+        var hotkeyBox = CreateGroupBox("단축키 설정", 22, 542, 370, 112);
         _ctrlCheck.Text = "Ctrl";
         _ctrlCheck.Left = 18;
         _ctrlCheck.Top = 32;
@@ -480,7 +502,7 @@ internal sealed class MainForm : Form
 
         hotkeyBox.Controls.AddRange(new Control[] { _ctrlCheck, _altCheck, _shiftCheck, _hotkeyCombo, _applyHotkeyButton });
 
-        var folderBox = CreateGroupBox("저장 폴더", 410, 502, 370, 112);
+        var folderBox = CreateGroupBox("저장 폴더", 410, 542, 370, 112);
         _folderLabel.Text = "";
         _folderLabel.Left = 18;
         _folderLabel.Top = 28;
@@ -504,7 +526,7 @@ internal sealed class MainForm : Form
 
         folderBox.Controls.AddRange(new Control[] { _folderLabel, _openFolderButton, _setFolderButton });
 
-        var updateBox = CreateGroupBox("자동 업데이트", 22, 628, 758, 96);
+        var updateBox = CreateGroupBox("자동 업데이트", 22, 668, 758, 96);
         AddLabel(updateBox, "GitHub 소유자", 18, 32, 95);
         _githubOwnerBox.Left = 112;
         _githubOwnerBox.Top = 28;
@@ -535,7 +557,7 @@ internal sealed class MainForm : Form
 
         updateBox.Controls.AddRange(new Control[] { _githubOwnerBox, _githubRepoBox, _checkUpdatesOnStartCheck, _checkUpdateButton });
 
-        var logBox = CreateGroupBox("로그", 22, 738, 758, 106);
+        var logBox = CreateGroupBox("로그", 22, 778, 758, 106);
         _logBox.Left = 18;
         _logBox.Top = 26;
         _logBox.Width = 722;
@@ -650,7 +672,8 @@ internal sealed class MainForm : Form
             _ => 0
         };
 
-        _audioDelayInput.Value = Clamp(_settings.AudioDelayMs, 0, 5000);
+        _audioDelayInput.Value = Clamp(_settings.AudioDelayMs, -3500, 5000);
+        _micVolumeInput.Value = Clamp(_settings.MicVolumePercent, 50, 500);
         _githubOwnerBox.Text = _settings.GitHubOwner;
         _githubRepoBox.Text = _settings.GitHubRepo;
         _checkUpdatesOnStartCheck.Checked = _settings.CheckUpdatesOnStart;
@@ -668,6 +691,7 @@ internal sealed class MainForm : Form
         _settings.OutputDeviceIds = _outputDeviceList.CheckedItems.OfType<AudioDeviceItem>().Select(item => item.Id).ToList();
         _settings.MicDeviceIds = _micDeviceList.CheckedItems.OfType<AudioDeviceItem>().Select(item => item.Id).ToList();
         _settings.AudioDelayMs = (int)_audioDelayInput.Value;
+        _settings.MicVolumePercent = (int)_micVolumeInput.Value;
         _settings.DrawMouse = _mouseCheck.Checked;
         _settings.HotkeyCtrl = _ctrlCheck.Checked;
         _settings.HotkeyAlt = _altCheck.Checked;
@@ -960,6 +984,140 @@ internal sealed class MainForm : Form
         }
     }
 
+    private void ToggleMicTest()
+    {
+        if (_micTestRunning)
+        {
+            StopMicTest();
+            return;
+        }
+
+        StartMicTest();
+    }
+
+    private void StartMicTest()
+    {
+        StopMicTest();
+        SaveUiSettings();
+
+        try
+        {
+            using var enumerator = new MMDeviceEnumerator();
+            var micIds = _settings.MicDeviceIds.ToList();
+
+            if (micIds.Count == 0)
+            {
+                try
+                {
+                    micIds.Add(enumerator.GetDefaultAudioEndpoint(DataFlow.Capture, Role.Multimedia).ID);
+                }
+                catch
+                {
+                }
+            }
+
+            foreach (var id in micIds.Distinct())
+            {
+                try
+                {
+                    var device = enumerator.GetDevice(id);
+                    var capture = new WasapiCapture(device);
+                    var buffer = new BufferedWaveProvider(capture.WaveFormat)
+                    {
+                        DiscardOnBufferOverflow = true,
+                        BufferDuration = TimeSpan.FromMilliseconds(600)
+                    };
+                    var output = new WaveOutEvent
+                    {
+                        DesiredLatency = 120
+                    };
+
+                    output.Init(buffer);
+                    capture.DataAvailable += (_, e) =>
+                    {
+                        if (e.BytesRecorded <= 0)
+                        {
+                            return;
+                        }
+
+                        var data = new byte[e.BytesRecorded];
+                        Array.Copy(e.Buffer, data, e.BytesRecorded);
+                        ApplyGainInPlace(data, data.Length, capture.WaveFormat, _settings.MicVolumePercent / 100f);
+                        buffer.AddSamples(data, 0, data.Length);
+                    };
+                    capture.RecordingStopped += (_, e) =>
+                    {
+                        if (e.Exception != null)
+                        {
+                            SafeUi(() => Log("마이크 테스트 중단: " + e.Exception.Message));
+                        }
+                    };
+
+                    output.Play();
+                    capture.StartRecording();
+                    _micMonitorSessions.Add(new MicMonitorSession(capture, output, buffer));
+                    Log("마이크 테스트 시작: " + device.FriendlyName);
+                }
+                catch (Exception ex)
+                {
+                    Log("마이크 테스트 시작 실패: " + ex.Message);
+                }
+            }
+
+            _micTestRunning = _micMonitorSessions.Count > 0;
+            _micTestButton.Text = _micTestRunning ? "마이크 테스트 중지" : "마이크 테스트 시작";
+
+            if (!_micTestRunning)
+            {
+                Log("테스트할 마이크를 시작하지 못했습니다.");
+            }
+        }
+        catch (Exception ex)
+        {
+            Log("마이크 테스트 시작 실패: " + ex.Message);
+            StopMicTest();
+        }
+    }
+
+    private void StopMicTest()
+    {
+        foreach (var session in _micMonitorSessions.ToList())
+        {
+            try
+            {
+                session.Capture.StopRecording();
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                session.Capture.Dispose();
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                session.Output.Stop();
+                session.Output.Dispose();
+            }
+            catch
+            {
+            }
+        }
+
+        _micMonitorSessions.Clear();
+        _micTestRunning = false;
+
+        if (!IsDisposed)
+        {
+            SafeUi(() => _micTestButton.Text = "마이크 테스트 시작");
+        }
+    }
+
     private void StartAudioCaptureIfNeeded()
     {
         StopAudioCapture();
@@ -994,7 +1152,7 @@ internal sealed class MainForm : Form
                 {
                     var device = enumerator.GetDevice(id);
                     var capture = new WasapiLoopbackCapture(device);
-                    var session = new AudioCaptureSession(device.FriendlyName, capture, capture.WaveFormat);
+                    var session = new AudioCaptureSession(device.FriendlyName, capture, capture.WaveFormat, false);
                     capture.DataAvailable += (_, e) => OnAudioDataAvailable(session, e);
                     capture.RecordingStopped += (_, e) =>
                     {
@@ -1022,7 +1180,7 @@ internal sealed class MainForm : Form
                 {
                     var device = enumerator.GetDevice(id);
                     var capture = new WasapiCapture(device);
-                    var session = new AudioCaptureSession(device.FriendlyName, capture, capture.WaveFormat);
+                    var session = new AudioCaptureSession(device.FriendlyName, capture, capture.WaveFormat, true);
                     capture.DataAvailable += (_, e) => OnAudioDataAvailable(session, e);
                     capture.RecordingStopped += (_, e) =>
                     {
@@ -1093,12 +1251,17 @@ internal sealed class MainForm : Form
             return;
         }
 
+        var data = new byte[e.BytesRecorded];
+        Array.Copy(e.Buffer, data, e.BytesRecorded);
+
+        if (session.IsMic)
+        {
+            ApplyGainInPlace(data, data.Length, session.Format, _settings.MicVolumePercent / 100f);
+        }
+
         lock (session.Lock)
         {
-            for (var i = 0; i < e.BytesRecorded; i++)
-            {
-                session.Ring.Add(e.Buffer[i]);
-            }
+            session.Ring.AddRange(data);
 
             var averageBytesPerSecond = Math.Max(1, session.Format.AverageBytesPerSecond);
             var maxBytes = averageBytesPerSecond * (BufferSeconds + 12);
@@ -1109,10 +1272,58 @@ internal sealed class MainForm : Form
         }
     }
 
+    private static void ApplyGainInPlace(byte[] buffer, int bytesRecorded, WaveFormat format, float gain)
+    {
+        if (gain <= 0 || Math.Abs(gain - 1f) < 0.001f)
+        {
+            return;
+        }
+
+        try
+        {
+            if ((format.Encoding == WaveFormatEncoding.IeeeFloat || format.Encoding == WaveFormatEncoding.Extensible) && format.BitsPerSample == 32)
+            {
+                for (var i = 0; i + 3 < bytesRecorded; i += 4)
+                {
+                    var value = BitConverter.ToSingle(buffer, i) * gain;
+                    value = Math.Clamp(value, -1f, 1f);
+                    BitConverter.GetBytes(value).CopyTo(buffer, i);
+                }
+                return;
+            }
+
+            if (format.Encoding == WaveFormatEncoding.Pcm && format.BitsPerSample == 16)
+            {
+                for (var i = 0; i + 1 < bytesRecorded; i += 2)
+                {
+                    var value = (int)(BitConverter.ToInt16(buffer, i) * gain);
+                    value = Math.Clamp(value, short.MinValue, short.MaxValue);
+                    var bytes = BitConverter.GetBytes((short)value);
+                    buffer[i] = bytes[0];
+                    buffer[i + 1] = bytes[1];
+                }
+                return;
+            }
+
+            if (format.Encoding == WaveFormatEncoding.Pcm && format.BitsPerSample == 32)
+            {
+                for (var i = 0; i + 3 < bytesRecorded; i += 4)
+                {
+                    var value = (long)(BitConverter.ToInt32(buffer, i) * gain);
+                    value = Math.Clamp(value, int.MinValue, int.MaxValue);
+                    BitConverter.GetBytes((int)value).CopyTo(buffer, i);
+                }
+            }
+        }
+        catch
+        {
+        }
+    }
+
     private async Task<List<string>> WriteRecentAudioFilesAsync(string folder, int seconds)
     {
         var files = new List<string>();
-        var delayMs = Clamp(_settings.AudioDelayMs, 0, 5000);
+        var delayMs = Clamp(AudioDelayBaseMs + _settings.AudioDelayMs, 0, 10000);
         var index = 0;
 
         foreach (var session in _audioSessions.ToList())
@@ -1396,7 +1607,15 @@ internal sealed class MainForm : Form
             var tag = root.GetProperty("tag_name").GetString() ?? "";
             var latestVersion = ParseVersion(tag);
 
-            if (latestVersion == null || latestVersion.CompareTo(Program.AppVersion) <= 0)
+            Log($"업데이트 버전 확인: 현재 {Program.AppVersion} / 최신 {tag}");
+
+            if (latestVersion == null)
+            {
+                MessageBox.Show("최신 릴리즈 태그에서 버전 정보를 읽지 못했습니다. 태그를 v0.5.0 형식으로 만들어 주세요.", "ShotLog 업데이트", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            if (latestVersion.CompareTo(Program.AppVersion) <= 0)
             {
                 if (showNoUpdate)
                 {
@@ -1871,19 +2090,35 @@ del "%~f0" > nul 2>nul
 
     private sealed class AudioCaptureSession
     {
-        public AudioCaptureSession(string name, IWaveIn capture, WaveFormat format)
+        public AudioCaptureSession(string name, IWaveIn capture, WaveFormat format, bool isMic)
         {
             Name = name;
             Capture = capture;
             Format = format;
+            IsMic = isMic;
         }
 
         public string Name { get; }
         public IWaveIn Capture { get; }
         public WaveFormat Format { get; }
+        public bool IsMic { get; }
         public object Lock { get; } = new();
         public List<byte> Ring { get; } = new();
         public bool IsRunning { get; set; }
+    }
+
+    private sealed class MicMonitorSession
+    {
+        public MicMonitorSession(WasapiCapture capture, WaveOutEvent output, BufferedWaveProvider buffer)
+        {
+            Capture = capture;
+            Output = output;
+            Buffer = buffer;
+        }
+
+        public WasapiCapture Capture { get; }
+        public WaveOutEvent Output { get; }
+        public BufferedWaveProvider Buffer { get; }
     }
 
     private readonly record struct CaptureAttempt(string Name, string Arguments);
@@ -1899,7 +2134,9 @@ internal sealed class AppSettings
     public bool IncludeAudio { get; set; } = true;
     public List<string> OutputDeviceIds { get; set; } = new();
     public List<string> MicDeviceIds { get; set; } = new();
-    public int AudioDelayMs { get; set; } = 1500;
+    public int AudioDelayMs { get; set; } = 3500;
+    public bool AudioDelayBaseMigrated { get; set; } = false;
+    public int MicVolumePercent { get; set; } = 100;
     public bool DrawMouse { get; set; } = false;
     public string CaptureMode { get; set; } = "auto";
     public string OutputFolder { get; set; } = AppPaths.DefaultOutputFolder;
@@ -1918,7 +2155,14 @@ internal sealed class AppSettings
         BitrateMbps = Math.Max(5, Math.Min(80, BitrateMbps));
         OutputDeviceIds ??= new List<string>();
         MicDeviceIds ??= new List<string>();
-        AudioDelayMs = Math.Max(0, Math.Min(5000, AudioDelayMs));
+        if (!AudioDelayBaseMigrated)
+        {
+            AudioDelayMs -= 3500;
+            AudioDelayBaseMigrated = true;
+        }
+
+        AudioDelayMs = Math.Max(-3500, Math.Min(5000, AudioDelayMs));
+        MicVolumePercent = Math.Max(50, Math.Min(500, MicVolumePercent));
 
         if (string.IsNullOrWhiteSpace(OutputFolder))
         {
