@@ -8,6 +8,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using Microsoft.Win32;
+using NAudio.CoreAudioApi;
 using NAudio.Wave;
 using Timer = System.Windows.Forms.Timer;
 
@@ -136,6 +137,10 @@ internal sealed class MainForm : Form
     private readonly CheckBox _altCheck = new();
     private readonly CheckBox _shiftCheck = new();
     private readonly CheckBox _audioCheck = new();
+    private readonly CheckedListBox _outputDeviceList = new();
+    private readonly CheckedListBox _micDeviceList = new();
+    private readonly NumericUpDown _audioDelayInput = new();
+    private readonly Button _refreshAudioDevicesButton = new();
     private readonly CheckBox _mouseCheck = new();
     private readonly Button _toggleRecordButton = new();
     private readonly Button _saveButton = new();
@@ -159,11 +164,9 @@ internal sealed class MainForm : Form
     private readonly StringBuilder _ffmpegLog = new();
     private bool _forceGdiUntilManualStart;
 
-    private WasapiLoopbackCapture? _audioCapture;
-    private WaveFormat? _audioFormat;
-    private readonly object _audioLock = new();
-    private readonly List<byte> _audioRing = new();
-    private long _audioBytesCaptured;
+    private readonly List<AudioCaptureSession> _audioSessions = new();
+    private readonly List<AudioDeviceItem> _outputDevices = new();
+    private readonly List<AudioDeviceItem> _micDevices = new();
     private bool _audioRunning;
 
     private int BufferSeconds => (int)_secondsInput.Value;
@@ -181,9 +184,9 @@ internal sealed class MainForm : Form
 
         Text = "ShotLog";
         Width = 820;
-        Height = 720;
+        Height = 900;
         StartPosition = FormStartPosition.CenterScreen;
-        MinimumSize = new Size(820, 720);
+        MinimumSize = new Size(820, 900);
         BackColor = Color.FromArgb(18, 19, 25);
         ForeColor = Color.White;
         Icon = _formIcon;
@@ -353,7 +356,7 @@ internal sealed class MainForm : Form
         _engineCombo.DropDownStyle = ComboBoxStyle.DropDownList;
         _engineCombo.Items.AddRange(new object[] { "자동", "고성능(DDA)", "호환(GDI)" });
 
-        _audioCheck.Text = "시스템 소리 포함";
+        _audioCheck.Text = "오디오 녹음 사용";
         _audioCheck.Left = 310;
         _audioCheck.Top = 74;
         _audioCheck.Width = 135;
@@ -404,7 +407,46 @@ internal sealed class MainForm : Form
             _toggleRecordButton, _saveButton, _availableLabel
         });
 
-        var hotkeyBox = CreateGroupBox("단축키 설정", 22, 316, 370, 112);
+        var audioBox = CreateGroupBox("오디오 설정", 22, 316, 758, 170);
+        AddLabel(audioBox, "출력 장치", 18, 30, 80);
+        _outputDeviceList.Left = 18;
+        _outputDeviceList.Top = 54;
+        _outputDeviceList.Width = 340;
+        _outputDeviceList.Height = 76;
+        _outputDeviceList.CheckOnClick = true;
+        _outputDeviceList.BackColor = Color.FromArgb(10, 11, 15);
+        _outputDeviceList.ForeColor = Color.FromArgb(225, 225, 230);
+
+        AddLabel(audioBox, "마이크", 382, 30, 80);
+        _micDeviceList.Left = 382;
+        _micDeviceList.Top = 54;
+        _micDeviceList.Width = 340;
+        _micDeviceList.Height = 76;
+        _micDeviceList.CheckOnClick = true;
+        _micDeviceList.BackColor = Color.FromArgb(10, 11, 15);
+        _micDeviceList.ForeColor = Color.FromArgb(225, 225, 230);
+
+        AddLabel(audioBox, "소리 동기 보정(ms)", 18, 138, 130);
+        _audioDelayInput.Left = 154;
+        _audioDelayInput.Top = 134;
+        _audioDelayInput.Width = 90;
+        _audioDelayInput.Minimum = 0;
+        _audioDelayInput.Maximum = 5000;
+        _audioDelayInput.Increment = 100;
+
+        _refreshAudioDevicesButton.Text = "오디오 장치 새로고침";
+        _refreshAudioDevicesButton.Left = 382;
+        _refreshAudioDevicesButton.Top = 132;
+        _refreshAudioDevicesButton.Width = 340;
+        _refreshAudioDevicesButton.Height = 30;
+        _refreshAudioDevicesButton.Click += (_, _) => LoadAudioDevicesToUi(true);
+
+        audioBox.Controls.AddRange(new Control[]
+        {
+            _outputDeviceList, _micDeviceList, _audioDelayInput, _refreshAudioDevicesButton
+        });
+
+        var hotkeyBox = CreateGroupBox("단축키 설정", 22, 502, 370, 112);
         _ctrlCheck.Text = "Ctrl";
         _ctrlCheck.Left = 18;
         _ctrlCheck.Top = 32;
@@ -438,7 +480,7 @@ internal sealed class MainForm : Form
 
         hotkeyBox.Controls.AddRange(new Control[] { _ctrlCheck, _altCheck, _shiftCheck, _hotkeyCombo, _applyHotkeyButton });
 
-        var folderBox = CreateGroupBox("저장 폴더", 410, 316, 370, 112);
+        var folderBox = CreateGroupBox("저장 폴더", 410, 502, 370, 112);
         _folderLabel.Text = "";
         _folderLabel.Left = 18;
         _folderLabel.Top = 28;
@@ -462,7 +504,7 @@ internal sealed class MainForm : Form
 
         folderBox.Controls.AddRange(new Control[] { _folderLabel, _openFolderButton, _setFolderButton });
 
-        var updateBox = CreateGroupBox("자동 업데이트", 22, 442, 758, 96);
+        var updateBox = CreateGroupBox("자동 업데이트", 22, 628, 758, 96);
         AddLabel(updateBox, "GitHub 소유자", 18, 32, 95);
         _githubOwnerBox.Left = 112;
         _githubOwnerBox.Top = 28;
@@ -493,7 +535,7 @@ internal sealed class MainForm : Form
 
         updateBox.Controls.AddRange(new Control[] { _githubOwnerBox, _githubRepoBox, _checkUpdatesOnStartCheck, _checkUpdateButton });
 
-        var logBox = CreateGroupBox("로그", 22, 552, 758, 106);
+        var logBox = CreateGroupBox("로그", 22, 738, 758, 106);
         _logBox.Left = 18;
         _logBox.Top = 26;
         _logBox.Width = 722;
@@ -509,7 +551,7 @@ internal sealed class MainForm : Form
         Controls.AddRange(new Control[]
         {
             _logoBox, title, subtitle, _statusLabel, _engineLabel, _hotkeyInfoLabel, _trayInfoLabel,
-            captureBox, hotkeyBox, folderBox, updateBox, logBox
+            captureBox, audioBox, hotkeyBox, folderBox, updateBox, logBox
         });
 
         foreach (var button in GetAllControls(this).OfType<Button>())
@@ -608,10 +650,12 @@ internal sealed class MainForm : Form
             _ => 0
         };
 
+        _audioDelayInput.Value = Clamp(_settings.AudioDelayMs, 0, 5000);
         _githubOwnerBox.Text = _settings.GitHubOwner;
         _githubRepoBox.Text = _settings.GitHubRepo;
         _checkUpdatesOnStartCheck.Checked = _settings.CheckUpdatesOnStart;
         _folderLabel.Text = ShortenPath(_settings.OutputFolder, 46);
+        LoadAudioDevicesToUi(false);
         UpdateHotkeyLabel();
     }
 
@@ -621,6 +665,9 @@ internal sealed class MainForm : Form
         _settings.Fps = Fps;
         _settings.BitrateMbps = BitrateMbps;
         _settings.IncludeAudio = _audioCheck.Checked;
+        _settings.OutputDeviceIds = _outputDeviceList.CheckedItems.OfType<AudioDeviceItem>().Select(item => item.Id).ToList();
+        _settings.MicDeviceIds = _micDeviceList.CheckedItems.OfType<AudioDeviceItem>().Select(item => item.Id).ToList();
+        _settings.AudioDelayMs = (int)_audioDelayInput.Value;
         _settings.DrawMouse = _mouseCheck.Checked;
         _settings.HotkeyCtrl = _ctrlCheck.Checked;
         _settings.HotkeyAlt = _altCheck.Checked;
@@ -849,6 +896,70 @@ internal sealed class MainForm : Form
         return new CaptureAttempt("호환 GDI", args);
     }
 
+    private void LoadAudioDevicesToUi(bool log)
+    {
+        var previousOutputIds = _outputDeviceList.CheckedItems.OfType<AudioDeviceItem>().Select(item => item.Id).ToHashSet();
+        var previousMicIds = _micDeviceList.CheckedItems.OfType<AudioDeviceItem>().Select(item => item.Id).ToHashSet();
+
+        if (previousOutputIds.Count == 0)
+        {
+            previousOutputIds = _settings.OutputDeviceIds.ToHashSet();
+        }
+
+        if (previousMicIds.Count == 0)
+        {
+            previousMicIds = _settings.MicDeviceIds.ToHashSet();
+        }
+
+        _outputDevices.Clear();
+        _micDevices.Clear();
+        _outputDeviceList.Items.Clear();
+        _micDeviceList.Items.Clear();
+
+        try
+        {
+            using var enumerator = new MMDeviceEnumerator();
+            var defaultOutputId = string.Empty;
+
+            try
+            {
+                defaultOutputId = enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia).ID;
+            }
+            catch
+            {
+            }
+
+            foreach (var device in enumerator.EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active))
+            {
+                var item = new AudioDeviceItem(device.ID, device.FriendlyName, false);
+                _outputDevices.Add(item);
+                var index = _outputDeviceList.Items.Add(item);
+                var shouldCheck = previousOutputIds.Count > 0 ? previousOutputIds.Contains(item.Id) : item.Id == defaultOutputId;
+                _outputDeviceList.SetItemChecked(index, shouldCheck);
+            }
+
+            foreach (var device in enumerator.EnumerateAudioEndPoints(DataFlow.Capture, DeviceState.Active))
+            {
+                var item = new AudioDeviceItem(device.ID, device.FriendlyName, true);
+                _micDevices.Add(item);
+                var index = _micDeviceList.Items.Add(item);
+                _micDeviceList.SetItemChecked(index, previousMicIds.Contains(item.Id));
+            }
+
+            if (log)
+            {
+                Log($"오디오 장치 목록을 새로고침했습니다. 출력 {_outputDevices.Count}개 / 마이크 {_micDevices.Count}개");
+            }
+        }
+        catch (Exception ex)
+        {
+            if (log)
+            {
+                Log("오디오 장치 목록 불러오기 실패: " + ex.Message);
+            }
+        }
+    }
+
     private void StartAudioCaptureIfNeeded()
     {
         StopAudioCapture();
@@ -858,109 +969,209 @@ internal sealed class MainForm : Form
             return;
         }
 
+        SaveUiSettings();
+
         try
         {
-            lock (_audioLock)
+            using var enumerator = new MMDeviceEnumerator();
+            var started = 0;
+
+            var outputIds = _settings.OutputDeviceIds.ToList();
+            if (outputIds.Count == 0)
             {
-                _audioRing.Clear();
-                _audioBytesCaptured = 0;
+                try
+                {
+                    outputIds.Add(enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia).ID);
+                }
+                catch
+                {
+                }
             }
 
-            _audioCapture = new WasapiLoopbackCapture();
-            _audioFormat = _audioCapture.WaveFormat;
-            _audioCapture.DataAvailable += OnAudioDataAvailable;
-            _audioCapture.RecordingStopped += (_, e) =>
+            foreach (var id in outputIds.Distinct())
             {
-                _audioRunning = false;
-                if (e.Exception != null)
+                try
                 {
-                    SafeUi(() => Log("시스템 소리 녹음 중단: " + e.Exception.Message));
+                    var device = enumerator.GetDevice(id);
+                    var capture = new WasapiLoopbackCapture(device);
+                    var session = new AudioCaptureSession(device.FriendlyName, capture, capture.WaveFormat);
+                    capture.DataAvailable += (_, e) => OnAudioDataAvailable(session, e);
+                    capture.RecordingStopped += (_, e) =>
+                    {
+                        session.IsRunning = false;
+                        if (e.Exception != null)
+                        {
+                            SafeUi(() => Log($"출력 장치 녹음 중단: {session.Name} / {e.Exception.Message}"));
+                        }
+                    };
+                    _audioSessions.Add(session);
+                    capture.StartRecording();
+                    session.IsRunning = true;
+                    started++;
+                    Log("출력 장치 녹음 시작: " + device.FriendlyName);
                 }
-            };
-            _audioCapture.StartRecording();
-            _audioRunning = true;
-            Log("시스템 소리 녹음이 시작되었습니다.");
+                catch (Exception ex)
+                {
+                    Log("출력 장치 녹음 시작 실패: " + ex.Message);
+                }
+            }
+
+            foreach (var id in _settings.MicDeviceIds.Distinct())
+            {
+                try
+                {
+                    var device = enumerator.GetDevice(id);
+                    var capture = new WasapiCapture(device);
+                    var session = new AudioCaptureSession(device.FriendlyName, capture, capture.WaveFormat);
+                    capture.DataAvailable += (_, e) => OnAudioDataAvailable(session, e);
+                    capture.RecordingStopped += (_, e) =>
+                    {
+                        session.IsRunning = false;
+                        if (e.Exception != null)
+                        {
+                            SafeUi(() => Log($"마이크 녹음 중단: {session.Name} / {e.Exception.Message}"));
+                        }
+                    };
+                    _audioSessions.Add(session);
+                    capture.StartRecording();
+                    session.IsRunning = true;
+                    started++;
+                    Log("마이크 녹음 시작: " + device.FriendlyName);
+                }
+                catch (Exception ex)
+                {
+                    Log("마이크 녹음 시작 실패: " + ex.Message);
+                }
+            }
+
+            _audioRunning = started > 0;
+
+            if (!_audioRunning)
+            {
+                Log("선택된 오디오 장치로 녹음을 시작하지 못했습니다.");
+            }
         }
         catch (Exception ex)
         {
             _audioRunning = false;
-            Log("시스템 소리 녹음 시작 실패: " + ex.Message);
+            Log("오디오 녹음 시작 실패: " + ex.Message);
         }
     }
 
     private void StopAudioCapture()
     {
-        try
+        foreach (var session in _audioSessions.ToList())
         {
-            if (_audioCapture != null)
+            try
             {
-                _audioCapture.DataAvailable -= OnAudioDataAvailable;
-                _audioCapture.StopRecording();
-                _audioCapture.Dispose();
-                _audioCapture = null;
+                session.Capture.StopRecording();
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                if (session.Capture is IDisposable disposable)
+                {
+                    disposable.Dispose();
+                }
+            }
+            catch
+            {
             }
         }
-        catch
-        {
-        }
 
+        _audioSessions.Clear();
         _audioRunning = false;
     }
 
-    private void OnAudioDataAvailable(object? sender, WaveInEventArgs e)
+    private void OnAudioDataAvailable(AudioCaptureSession session, WaveInEventArgs e)
     {
         if (e.BytesRecorded <= 0)
         {
             return;
         }
 
-        lock (_audioLock)
+        lock (session.Lock)
         {
             for (var i = 0; i < e.BytesRecorded; i++)
             {
-                _audioRing.Add(e.Buffer[i]);
+                session.Ring.Add(e.Buffer[i]);
             }
 
-            _audioBytesCaptured += e.BytesRecorded;
-
-            var averageBytesPerSecond = Math.Max(1, _audioFormat?.AverageBytesPerSecond ?? 192000);
-            var maxBytes = averageBytesPerSecond * (BufferSeconds + 8);
-            if (_audioRing.Count > maxBytes)
+            var averageBytesPerSecond = Math.Max(1, session.Format.AverageBytesPerSecond);
+            var maxBytes = averageBytesPerSecond * (BufferSeconds + 12);
+            if (session.Ring.Count > maxBytes)
             {
-                _audioRing.RemoveRange(0, _audioRing.Count - maxBytes);
+                session.Ring.RemoveRange(0, session.Ring.Count - maxBytes);
             }
         }
     }
 
-    private async Task<bool> WriteRecentAudioFileAsync(string path, int seconds)
+    private async Task<List<string>> WriteRecentAudioFilesAsync(string folder, int seconds)
     {
-        byte[] audioBytes;
-        WaveFormat? format;
+        var files = new List<string>();
+        var delayMs = Clamp(_settings.AudioDelayMs, 0, 5000);
+        var index = 0;
 
-        lock (_audioLock)
+        foreach (var session in _audioSessions.ToList())
         {
-            format = _audioFormat;
-            if (format == null || _audioRing.Count == 0)
+            byte[] audioBytes;
+            var format = session.Format;
+
+            lock (session.Lock)
             {
-                return false;
+                if (session.Ring.Count == 0)
+                {
+                    continue;
+                }
+
+                var blockAlign = Math.Max(1, format.BlockAlign);
+                var delayBytes = AlignToBlock((int)(format.AverageBytesPerSecond * (delayMs / 1000.0)), blockAlign);
+                var availableBytes = Math.Max(0, session.Ring.Count - delayBytes);
+                var requestedBytes = AlignToBlock(format.AverageBytesPerSecond * Math.Max(1, seconds), blockAlign);
+                var bytesToTake = Math.Min(availableBytes, requestedBytes);
+                bytesToTake = AlignToBlock(bytesToTake, blockAlign);
+
+                if (bytesToTake < blockAlign * 100)
+                {
+                    continue;
+                }
+
+                var start = Math.Max(0, session.Ring.Count - delayBytes - bytesToTake);
+                audioBytes = session.Ring.Skip(start).Take(bytesToTake).ToArray();
             }
 
-            var bytesToTake = Math.Min(_audioRing.Count, format.AverageBytesPerSecond * Math.Max(1, seconds));
-            audioBytes = _audioRing.Skip(_audioRing.Count - bytesToTake).ToArray();
+            if (audioBytes.Length < 1024)
+            {
+                continue;
+            }
+
+            var path = Path.Combine(folder, $"audio_{index++:00}.wav");
+            await Task.Run(() =>
+            {
+                using var writer = new WaveFileWriter(path, format);
+                writer.Write(audioBytes, 0, audioBytes.Length);
+            });
+
+            if (File.Exists(path) && new FileInfo(path).Length > 1024)
+            {
+                files.Add(path);
+            }
         }
 
-        if (audioBytes.Length < 1024)
+        return files;
+    }
+
+    private static int AlignToBlock(int value, int blockAlign)
+    {
+        if (blockAlign <= 1)
         {
-            return false;
+            return value;
         }
 
-        await Task.Run(() =>
-        {
-            using var writer = new WaveFileWriter(path, format);
-            writer.Write(audioBytes, 0, audioBytes.Length);
-        });
-
-        return File.Exists(path) && new FileInfo(path).Length > 1024;
+        return value - value % blockAlign;
     }
 
     private async Task SaveClipAsync(string reason)
@@ -988,7 +1199,6 @@ internal sealed class MainForm : Form
 
         var joinedTsPath = Path.Combine(workFolder, "joined.ts");
         var tempVideoPath = Path.Combine(workFolder, "video.mp4");
-        var tempAudioPath = Path.Combine(workFolder, "audio.wav");
         var outputPath = Path.Combine(_settings.OutputFolder, $"ShotLog_{DateTime.Now:yyyy-MM-dd_HH-mm-ss}_{reason}.mp4");
 
         try
@@ -1028,9 +1238,30 @@ internal sealed class MainForm : Form
             }
 
             var audioAdded = false;
-            if (_settings.IncludeAudio && await WriteRecentAudioFileAsync(tempAudioPath, seconds))
+            var audioFiles = _settings.IncludeAudio ? await WriteRecentAudioFilesAsync(workFolder, seconds) : new List<string>();
+
+            if (audioFiles.Count > 0)
             {
-                var muxArgs = $"-hide_banner -loglevel warning -y -i \"{tempVideoPath}\" -i \"{tempAudioPath}\" -map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -b:a 192k -shortest -movflags +faststart \"{outputPath}\"";
+                var inputArgs = new StringBuilder();
+                inputArgs.Append($"-hide_banner -loglevel warning -y -i \"{tempVideoPath}\" ");
+
+                foreach (var audioFile in audioFiles)
+                {
+                    inputArgs.Append($"-i \"{audioFile}\" ");
+                }
+
+                string muxArgs;
+
+                if (audioFiles.Count == 1)
+                {
+                    muxArgs = inputArgs + $"-map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -b:a 192k -shortest -movflags +faststart \"{outputPath}\"";
+                }
+                else
+                {
+                    var filterInputs = string.Concat(Enumerable.Range(1, audioFiles.Count).Select(i => $"[{i}:a]"));
+                    muxArgs = inputArgs + $"-filter_complex \"{filterInputs}amix=inputs={audioFiles.Count}:duration=longest:dropout_transition=0[aout]\" -map 0:v:0 -map \"[aout]\" -c:v copy -c:a aac -b:a 192k -shortest -movflags +faststart \"{outputPath}\"";
+                }
+
                 var muxResult = await RunProcessAsync(ffmpegPath, muxArgs);
                 audioAdded = muxResult.ExitCode == 0 && File.Exists(outputPath) && new FileInfo(outputPath).Length > 1024;
 
@@ -1045,7 +1276,7 @@ internal sealed class MainForm : Form
                 File.Copy(tempVideoPath, outputPath, true);
             }
 
-            Log($"클립 저장 완료: 약 {seconds}초 / {(audioAdded ? "소리 포함" : "영상만")} / {Path.GetFileName(outputPath)}");
+            Log($"클립 저장 완료: 약 {seconds}초 / {(audioAdded ? $"소리 포함({audioFiles.Count}개)" : "영상만")} / {Path.GetFileName(outputPath)}");
         }
         catch (Exception ex)
         {
@@ -1090,7 +1321,7 @@ internal sealed class MainForm : Form
         CleanBufferFolder(false);
         var count = GetCompletedSegments().Count;
         var available = Math.Min(BufferSeconds, count);
-        var audioStatus = _settings.IncludeAudio ? (_audioRunning ? " / 시스템 소리 녹음 중" : " / 시스템 소리 대기") : "";
+        var audioStatus = _settings.IncludeAudio ? (_audioRunning ? $" / 오디오 {_audioSessions.Count}개 녹음 중" : " / 오디오 대기") : "";
         _availableLabel.Text = $"저장 가능 영상 : {available}초 / {BufferSeconds}초 ({count}개 조각){audioStatus}";
         _toggleRecordButton.Text = _recording ? "상시녹화 중지" : "상시녹화 시작";
         _engineLabel.Text = "캡처 엔진 : " + _activeEngineName;
@@ -1622,6 +1853,39 @@ del "%~f0" > nul 2>nul
         return path[..18] + "..." + path[^Math.Min(24, path.Length)..];
     }
 
+    private sealed class AudioDeviceItem
+    {
+        public AudioDeviceItem(string id, string name, bool isInput)
+        {
+            Id = id;
+            Name = name;
+            IsInput = isInput;
+        }
+
+        public string Id { get; }
+        public string Name { get; }
+        public bool IsInput { get; }
+
+        public override string ToString() => Name;
+    }
+
+    private sealed class AudioCaptureSession
+    {
+        public AudioCaptureSession(string name, IWaveIn capture, WaveFormat format)
+        {
+            Name = name;
+            Capture = capture;
+            Format = format;
+        }
+
+        public string Name { get; }
+        public IWaveIn Capture { get; }
+        public WaveFormat Format { get; }
+        public object Lock { get; } = new();
+        public List<byte> Ring { get; } = new();
+        public bool IsRunning { get; set; }
+    }
+
     private readonly record struct CaptureAttempt(string Name, string Arguments);
     private readonly record struct ProcessResult(int ExitCode, string OutputText, string ErrorText);
     private readonly record struct UpdateAsset(string Name, string DownloadUrl);
@@ -1633,6 +1897,9 @@ internal sealed class AppSettings
     public int Fps { get; set; } = 60;
     public int BitrateMbps { get; set; } = 20;
     public bool IncludeAudio { get; set; } = true;
+    public List<string> OutputDeviceIds { get; set; } = new();
+    public List<string> MicDeviceIds { get; set; } = new();
+    public int AudioDelayMs { get; set; } = 1500;
     public bool DrawMouse { get; set; } = false;
     public string CaptureMode { get; set; } = "auto";
     public string OutputFolder { get; set; } = AppPaths.DefaultOutputFolder;
@@ -1649,6 +1916,9 @@ internal sealed class AppSettings
         BufferSeconds = Math.Max(5, Math.Min(120, BufferSeconds));
         Fps = Fps < 30 ? 60 : Math.Max(30, Math.Min(144, Fps));
         BitrateMbps = Math.Max(5, Math.Min(80, BitrateMbps));
+        OutputDeviceIds ??= new List<string>();
+        MicDeviceIds ??= new List<string>();
+        AudioDelayMs = Math.Max(0, Math.Min(5000, AudioDelayMs));
 
         if (string.IsNullOrWhiteSpace(OutputFolder))
         {
