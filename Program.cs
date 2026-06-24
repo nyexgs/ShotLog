@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Drawing;
 using System.IO.Compression;
+using System.Globalization;
 using System.Net.Http.Headers;
 using System.Reflection;
 using System.Runtime.InteropServices;
@@ -30,7 +31,7 @@ internal static class Program
             return version;
         }
 
-        return assembly.GetName().Version ?? new Version(0, 5, 0);
+        return assembly.GetName().Version ?? new Version(0, 8, 0);
     }
 
     [STAThread]
@@ -1268,16 +1269,24 @@ internal sealed class MainForm : Form
             ApplyGainInPlace(data, data.Length, session.Format, _settings.MicVolumePercent / 100f);
         }
 
+        var averageBytesPerSecond = Math.Max(1, session.Format.AverageBytesPerSecond);
+        var chunkEndUtc = DateTime.UtcNow;
+        var chunkDurationSeconds = data.Length / (double)averageBytesPerSecond;
+        var chunkStartUtc = chunkEndUtc.AddSeconds(-chunkDurationSeconds);
+
         lock (session.Lock)
         {
             session.Ring.AddRange(data);
+            session.Chunks.Add(new AudioChunk(chunkStartUtc, chunkEndUtc, data));
 
-            var averageBytesPerSecond = Math.Max(1, session.Format.AverageBytesPerSecond);
-            var maxBytes = averageBytesPerSecond * (BufferSeconds + 12);
+            var maxBytes = averageBytesPerSecond * (BufferSeconds + 15);
             if (session.Ring.Count > maxBytes)
             {
                 session.Ring.RemoveRange(0, session.Ring.Count - maxBytes);
             }
+
+            var cutoffUtc = DateTime.UtcNow.AddSeconds(-(BufferSeconds + 15));
+            session.Chunks.RemoveAll(chunk => chunk.EndUtc < cutoffUtc);
         }
     }
 
@@ -1329,10 +1338,12 @@ internal sealed class MainForm : Form
         }
     }
 
-    private async Task<List<string>> WriteRecentAudioFilesAsync(string folder, int seconds)
+    private async Task<List<string>> WriteRecentAudioFilesAsync(string folder, DateTime clipStartUtc, DateTime clipEndUtc)
     {
         var files = new List<string>();
         var delayMs = Clamp(AudioDelayBaseMs + _settings.AudioDelayMs, 0, 10000);
+        var audioStartUtc = clipStartUtc.AddMilliseconds(-delayMs);
+        var audioEndUtc = clipEndUtc.AddMilliseconds(-delayMs);
         var index = 0;
 
         foreach (var session in _audioSessions.ToList())
@@ -1342,25 +1353,43 @@ internal sealed class MainForm : Form
 
             lock (session.Lock)
             {
-                if (session.Ring.Count == 0)
+                if (session.Chunks.Count == 0)
                 {
                     continue;
                 }
 
                 var blockAlign = Math.Max(1, format.BlockAlign);
-                var delayBytes = AlignToBlock((int)(format.AverageBytesPerSecond * (delayMs / 1000.0)), blockAlign);
-                var availableBytes = Math.Max(0, session.Ring.Count - delayBytes);
-                var requestedBytes = AlignToBlock(format.AverageBytesPerSecond * Math.Max(1, seconds), blockAlign);
-                var bytesToTake = Math.Min(availableBytes, requestedBytes);
-                bytesToTake = AlignToBlock(bytesToTake, blockAlign);
+                var averageBytesPerSecond = Math.Max(1, format.AverageBytesPerSecond);
+                using var stream = new MemoryStream();
 
-                if (bytesToTake < blockAlign * 100)
+                foreach (var chunk in session.Chunks.Where(chunk => chunk.EndUtc > audioStartUtc && chunk.StartUtc < audioEndUtc).OrderBy(chunk => chunk.StartUtc))
                 {
-                    continue;
+                    var startOffsetBytes = 0;
+                    var endOffsetBytes = chunk.Data.Length;
+
+                    if (chunk.StartUtc < audioStartUtc)
+                    {
+                        var skipSeconds = Math.Max(0, (audioStartUtc - chunk.StartUtc).TotalSeconds);
+                        startOffsetBytes = AlignToBlock((int)(averageBytesPerSecond * skipSeconds), blockAlign);
+                    }
+
+                    if (chunk.EndUtc > audioEndUtc)
+                    {
+                        var keepSeconds = Math.Max(0, (audioEndUtc - chunk.StartUtc).TotalSeconds);
+                        endOffsetBytes = AlignToBlock((int)(averageBytesPerSecond * keepSeconds), blockAlign);
+                    }
+
+                    startOffsetBytes = Math.Max(0, Math.Min(startOffsetBytes, chunk.Data.Length));
+                    endOffsetBytes = Math.Max(startOffsetBytes, Math.Min(endOffsetBytes, chunk.Data.Length));
+                    var count = AlignToBlock(endOffsetBytes - startOffsetBytes, blockAlign);
+
+                    if (count > 0 && startOffsetBytes + count <= chunk.Data.Length)
+                    {
+                        stream.Write(chunk.Data, startOffsetBytes, count);
+                    }
                 }
 
-                var start = Math.Max(0, session.Ring.Count - delayBytes - bytesToTake);
-                audioBytes = session.Ring.Skip(start).Take(bytesToTake).ToArray();
+                audioBytes = stream.ToArray();
             }
 
             if (audioBytes.Length < 1024)
@@ -1402,7 +1431,8 @@ internal sealed class MainForm : Form
             return;
         }
 
-        var segments = GetCompletedSegments().TakeLast(BufferSeconds).ToList();
+        var segmentInfos = GetCompletedSegmentInfos().TakeLast(BufferSeconds).ToList();
+        var segments = segmentInfos.Select(segment => segment.Path).ToList();
         if (segments.Count == 0)
         {
             Log("저장할 영상이 아직 없습니다. 상시녹화를 잠시 유지한 뒤 다시 저장해 주세요.");
@@ -1414,6 +1444,8 @@ internal sealed class MainForm : Form
         _statusLabel.Text = "클립 저장 중";
 
         var seconds = Math.Min(BufferSeconds, segments.Count);
+        var clipEndUtc = segmentInfos.Last().LastWriteTimeUtc;
+        var clipStartUtc = clipEndUtc.AddSeconds(-seconds);
         var workFolder = Path.Combine(AppPaths.LocalAppDataFolder, "clipwork", Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(workFolder);
 
@@ -1458,7 +1490,7 @@ internal sealed class MainForm : Form
             }
 
             var audioAdded = false;
-            var audioFiles = _settings.IncludeAudio ? await WriteRecentAudioFilesAsync(workFolder, seconds) : new List<string>();
+            var audioFiles = _settings.IncludeAudio ? await WriteRecentAudioFilesAsync(workFolder, clipStartUtc, clipEndUtc) : new List<string>();
 
             if (audioFiles.Count > 0)
             {
@@ -1471,15 +1503,16 @@ internal sealed class MainForm : Form
                 }
 
                 string muxArgs;
+                var clipDurationText = seconds.ToString(CultureInfo.InvariantCulture);
 
                 if (audioFiles.Count == 1)
                 {
-                    muxArgs = inputArgs + $"-map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -b:a 192k -shortest -movflags +faststart \"{outputPath}\"";
+                    muxArgs = inputArgs + $"-map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -b:a 192k -t {clipDurationText} -movflags +faststart \"{outputPath}\"";
                 }
                 else
                 {
                     var filterInputs = string.Concat(Enumerable.Range(1, audioFiles.Count).Select(i => $"[{i}:a]"));
-                    muxArgs = inputArgs + $"-filter_complex \"{filterInputs}amix=inputs={audioFiles.Count}:duration=longest:dropout_transition=0[aout]\" -map 0:v:0 -map \"[aout]\" -c:v copy -c:a aac -b:a 192k -shortest -movflags +faststart \"{outputPath}\"";
+                    muxArgs = inputArgs + $"-filter_complex \"{filterInputs}amix=inputs={audioFiles.Count}:duration=longest:dropout_transition=0[aout]\" -map 0:v:0 -map \"[aout]\" -c:v copy -c:a aac -b:a 192k -t {clipDurationText} -movflags +faststart \"{outputPath}\"";
                 }
 
                 var muxResult = await RunProcessAsync(ffmpegPath, muxArgs);
@@ -1539,7 +1572,7 @@ internal sealed class MainForm : Form
     private void UpdateBufferState()
     {
         CleanBufferFolder(false);
-        var count = GetCompletedSegments().Count;
+        var count = GetCompletedSegmentInfos().Count;
         var available = Math.Min(BufferSeconds, count);
         var audioStatus = _settings.IncludeAudio ? (_audioRunning ? $" / 오디오 {_audioSessions.Count}개 녹음 중" : " / 오디오 대기") : "";
         _availableLabel.Text = $"저장 가능 영상 : {available}초 / {BufferSeconds}초 ({count}개 조각){audioStatus}";
@@ -1547,11 +1580,11 @@ internal sealed class MainForm : Form
         _engineLabel.Text = "캡처 엔진 : " + _activeEngineName;
     }
 
-    private List<string> GetCompletedSegments()
+    private List<SegmentInfo> GetCompletedSegmentInfos()
     {
         if (!Directory.Exists(AppPaths.BufferFolder))
         {
-            return new List<string>();
+            return new List<SegmentInfo>();
         }
 
         var now = DateTime.Now;
@@ -1559,8 +1592,13 @@ internal sealed class MainForm : Form
             .Select(path => new FileInfo(path))
             .Where(file => file.Exists && file.Length > 1024 * 100 && (now - file.LastWriteTime).TotalMilliseconds > 2200)
             .OrderBy(file => file.LastWriteTimeUtc)
-            .Select(file => file.FullName)
+            .Select(file => new SegmentInfo(file.FullName, file.LastWriteTimeUtc))
             .ToList();
+    }
+
+    private List<string> GetCompletedSegments()
+    {
+        return GetCompletedSegmentInfos().Select(segment => segment.Path).ToList();
     }
 
     private void CleanBufferFolder(bool all)
@@ -1703,23 +1741,93 @@ internal sealed class MainForm : Form
             throw new InvalidOperationException("게시된 ShotLog.exe로 실행 중일 때만 자동 업데이트를 적용할 수 있습니다.");
         }
 
-        var updaterPath = Path.Combine(AppPaths.UpdatesFolder, "update.cmd");
+        var updaterPath = Path.Combine(AppPaths.UpdatesFolder, "ShotLogUpdater.ps1");
+        var updaterLog = Path.Combine(AppPaths.UpdatesFolder, "update.log");
+        var pid = Environment.ProcessId;
         var script = $$"""
-@echo off
-chcp 65001 > nul
-timeout /t 2 /nobreak > nul
-taskkill /PID {{Environment.ProcessId}} /F > nul 2>nul
-copy /Y "{{newExe}}" "{{currentExe}}" > nul
-start "" "{{currentExe}}"
-del "{{newExe}}" > nul 2>nul
-del "%~f0" > nul 2>nul
+$ErrorActionPreference = 'Continue'
+$pidToStop = {{pid}}
+$newExe = @'
+{{newExe}}
+'@
+$currentExe = @'
+{{currentExe}}
+'@
+$log = @'
+{{updaterLog}}
+'@
+function Write-UpdateLog($message) {
+    try {
+        $time = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+        Add-Content -LiteralPath $log -Value "[$time] $message" -Encoding UTF8
+    } catch {}
+}
+Write-UpdateLog "Updater started"
+Write-UpdateLog "newExe=$newExe"
+Write-UpdateLog "currentExe=$currentExe"
+Start-Sleep -Milliseconds 700
+try {
+    Stop-Process -Id $pidToStop -Force -ErrorAction SilentlyContinue
+    Write-UpdateLog "Stop-Process requested: $pidToStop"
+} catch {
+    Write-UpdateLog "Stop-Process error: $($_.Exception.Message)"
+}
+for ($i = 0; $i -lt 50; $i++) {
+    try {
+        $p = Get-Process -Id $pidToStop -ErrorAction SilentlyContinue
+        if ($null -eq $p) { break }
+    } catch { break }
+    Start-Sleep -Milliseconds 200
+}
+$copied = $false
+for ($i = 0; $i -lt 60; $i++) {
+    try {
+        if (!(Test-Path -LiteralPath $newExe)) {
+            Write-UpdateLog "Downloaded file not found"
+            break
+        }
+        Copy-Item -LiteralPath $newExe -Destination $currentExe -Force
+        $copied = $true
+        Write-UpdateLog "Copy success"
+        break
+    } catch {
+        Write-UpdateLog "Copy retry $i failed: $($_.Exception.Message)"
+        Start-Sleep -Milliseconds 500
+    }
+}
+if ($copied) {
+    try {
+        Start-Process -FilePath $currentExe -WorkingDirectory (Split-Path -LiteralPath $currentExe)
+        Write-UpdateLog "Restart success"
+    } catch {
+        Write-UpdateLog "Restart failed: $($_.Exception.Message)"
+    }
+} else {
+    Write-UpdateLog "Update failed"
+    try { Start-Process -FilePath $currentExe -WorkingDirectory (Split-Path -LiteralPath $currentExe) } catch {}
+}
+try { Remove-Item -LiteralPath $newExe -Force -ErrorAction SilentlyContinue } catch {}
+try { Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue } catch {}
 """;
-        await File.WriteAllTextAsync(updaterPath, script, Encoding.UTF8);
+        await File.WriteAllTextAsync(updaterPath, script, new UTF8Encoding(false));
 
         Log("업데이트 파일 다운로드 완료. ShotLog를 재시작합니다.");
-        Process.Start(new ProcessStartInfo(updaterPath) { UseShellExecute = true, WindowStyle = ProcessWindowStyle.Hidden });
+        Log($"업데이트 로그 위치: {updaterLog}");
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = "powershell.exe",
+            Arguments = $"-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"{updaterPath}\"",
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            WindowStyle = ProcessWindowStyle.Hidden
+        };
+        Process.Start(startInfo);
         _exitRequested = true;
-        Close();
+        BeginInvoke(new Action(() =>
+        {
+            Close();
+            Application.Exit();
+        }));
     }
 
     private static UpdateAsset? FindUpdateAsset(JsonElement assets)
@@ -2295,6 +2403,7 @@ del "%~f0" > nul 2>nul
         public bool IsMic { get; }
         public object Lock { get; } = new();
         public List<byte> Ring { get; } = new();
+        public List<AudioChunk> Chunks { get; } = new();
         public bool IsRunning { get; set; }
     }
 
@@ -2313,6 +2422,8 @@ del "%~f0" > nul 2>nul
     }
 
     private readonly record struct CaptureAttempt(string Name, string Arguments);
+    private readonly record struct SegmentInfo(string Path, DateTime LastWriteTimeUtc);
+    private readonly record struct AudioChunk(DateTime StartUtc, DateTime EndUtc, byte[] Data);
     private readonly record struct ProcessResult(int ExitCode, string OutputText, string ErrorText);
     private readonly record struct UpdateAsset(string Name, string DownloadUrl);
 }
