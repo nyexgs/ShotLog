@@ -8,10 +8,10 @@
     <AssemblyName>ShotLog</AssemblyName>
     <RootNamespace>ShotLog</RootNamespace>
     <ApplicationIcon>ShotLog.ico</ApplicationIcon>
-    <Version>0.10.1</Version>
-    <FileVersion>0.10.1.0</FileVersion>
-    <AssemblyVersion>0.10.1.0</AssemblyVersion>
-    <InformationalVersion>0.10.1</InformationalVersion>
+    <Version>0.11.1</Version>
+    <FileVersion>0.11.1.0</FileVersion>
+    <AssemblyVersion>0.11.1.0</AssemblyVersion>
+    <InformationalVersion>0.11.1</InformationalVersion>
     <PublishSingleFile>true</PublishSingleFile>
     <SelfContained>true</SelfContained>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
@@ -26,5 +26,6 @@
     <EmbeddedResource Include="ffmpeg.exe" LogicalName="ffmpeg.exe" Condition="Exists('ffmpeg.exe')" />
     <EmbeddedResource Include="ShotLog.ico" LogicalName="ShotLog.ico" Condition="Exists('ShotLog.ico')" />
     <EmbeddedResource Include="ShotLog.png" LogicalName="ShotLog.png" Condition="Exists('ShotLog.png')" />
+    <EmbeddedResource Include="OngeulipBerryRyowon.ttf" LogicalName="OngeulipBerryRyowon.ttf" Condition="Exists('OngeulipBerryRyowon.ttf')" />
   </ItemGroup>
 </Project>

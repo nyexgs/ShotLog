@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Drawing;
+using System.Drawing.Text;
 using System.IO.Compression;
 using System.Globalization;
 using System.Net.Http.Headers;
@@ -31,7 +32,7 @@ internal static class Program
             return version;
         }
 
-        return assembly.GetName().Version ?? new Version(0, 10, 1);
+        return assembly.GetName().Version ?? new Version(0, 11, 1);
     }
 
     [STAThread]
@@ -109,6 +110,17 @@ internal sealed class MainForm : Form
     private const int ModShift = 0x0004;
     private const int ModNoRepeat = 0x4000;
     private const int AudioDelayLimitMs = 5000;
+    private const int TitleBarHeight = 50;
+    private const int WindowCornerRadius = 14;
+    private const int WmNcLButtonDown = 0x00A1;
+    private const int HtCaption = 0x0002;
+    private const string UpdateGitHubOwner = "nyexgs";
+    private const string UpdateGitHubRepo = "ShotLog";
+
+    private static readonly Color AccentColor = Color.FromArgb(92, 247, 212);
+    private static readonly Color ActiveStatusColor = Color.FromArgb(71, 255, 120);
+    private static readonly Color InactiveStatusColor = Color.FromArgb(255, 92, 112);
+    private static readonly Color WarningStatusColor = Color.FromArgb(255, 205, 92);
 
     private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
 
@@ -133,6 +145,12 @@ internal sealed class MainForm : Form
     [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
     private static extern IntPtr GetModuleHandle(string? lpModuleName);
 
+    [DllImport("user32.dll")]
+    private static extern bool ReleaseCapture();
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr SendMessage(IntPtr hWnd, int msg, int wParam, int lParam);
+
     [StructLayout(LayoutKind.Sequential)]
     private struct KbdLlHookStruct
     {
@@ -153,11 +171,17 @@ internal sealed class MainForm : Form
     private readonly ToolStripMenuItem _startupMenuItem = new("시작 프로그램에 추가");
     private readonly ToolStripMenuItem _exitMenuItem = new("프로그램 종료하기");
 
+    private readonly PrivateFontCollection _privateFonts = new();
+    private readonly List<IntPtr> _fontMemory = new();
+    private readonly FontFamily _uiFontFamily;
+
+    private readonly Panel _titleBar = new();
     private readonly PictureBox _logoBox = new();
-    private readonly Label _statusLabel = new();
+    private readonly BadgeLabel _statusLabel = new();
     private readonly Label _hotkeyInfoLabel = new();
     private readonly Label _trayInfoLabel = new();
     private readonly Label _availableLabel = new();
+    private readonly ClipProgressBar _availableProgress = new();
     private readonly Label _folderLabel = new();
     private readonly Label _engineLabel = new();
     private readonly TextBox _logBox = new();
@@ -186,6 +210,9 @@ internal sealed class MainForm : Form
     private readonly TextBox _githubRepoBox = new();
     private readonly CheckBox _checkUpdatesOnStartCheck = new();
     private readonly Button _checkUpdateButton = new();
+    private readonly Button _exportLogButton = new();
+    private readonly Button _closeButton = new TitleCloseButton();
+    private readonly List<string> _logLines = new();
 
     private readonly Timer _bufferTimer = new() { Interval = 1000 };
     private Process? _ffmpegProcess;
@@ -222,13 +249,15 @@ internal sealed class MainForm : Form
 
         _formIcon = LoadIconResource();
         _trayIconImage = LoadIconResource();
+        _uiFontFamily = LoadUiFontFamily();
 
         Text = "ShotLog";
-        Width = 820;
-        Height = 940;
+        Width = 860;
+        Height = 790;
         StartPosition = FormStartPosition.CenterScreen;
-        MinimumSize = new Size(820, 940);
-        BackColor = Color.FromArgb(18, 19, 25);
+        MinimumSize = new Size(860, 790);
+        FormBorderStyle = FormBorderStyle.None;
+        BackColor = Color.FromArgb(15, 16, 22);
         ForeColor = Color.White;
         Icon = _formIcon;
 
@@ -293,7 +322,44 @@ internal sealed class MainForm : Form
         _logoBox.Image?.Dispose();
         _formIcon.Dispose();
         _trayIconImage.Dispose();
+        _privateFonts.Dispose();
+        foreach (var ptr in _fontMemory)
+        {
+            try { Marshal.FreeCoTaskMem(ptr); } catch { }
+        }
         base.OnFormClosed(e);
+    }
+
+    protected override void OnSizeChanged(EventArgs e)
+    {
+        base.OnSizeChanged(e);
+        ApplyRoundedWindowRegion();
+        CenterTitleStatus();
+    }
+
+    private void ApplyRoundedWindowRegion()
+    {
+        if (Width <= 0 || Height <= 0)
+        {
+            return;
+        }
+
+        using var path = CreateRoundPath(new Rectangle(0, 0, Width, Height), WindowCornerRadius);
+        var oldRegion = Region;
+        Region = new Region(path);
+        oldRegion?.Dispose();
+    }
+
+    private static System.Drawing.Drawing2D.GraphicsPath CreateRoundPath(Rectangle bounds, int radius)
+    {
+        var path = new System.Drawing.Drawing2D.GraphicsPath();
+        var diameter = radius * 2;
+        path.AddArc(bounds.Left, bounds.Top, diameter, diameter, 180, 90);
+        path.AddArc(bounds.Right - diameter, bounds.Top, diameter, diameter, 270, 90);
+        path.AddArc(bounds.Right - diameter, bounds.Bottom - diameter, diameter, diameter, 0, 90);
+        path.AddArc(bounds.Left, bounds.Bottom - diameter, diameter, diameter, 90, 90);
+        path.CloseFigure();
+        return path;
     }
 
     protected override void WndProc(ref Message m)
@@ -309,112 +375,86 @@ internal sealed class MainForm : Form
 
     private void BuildUi()
     {
-        var title = new Label
-        {
-            Text = "ShotLog",
-            Font = new Font("Segoe UI", 25, FontStyle.Bold),
-            Left = 104,
-            Top = 24,
-            Width = 260,
-            Height = 42
-        };
+        Font = UiFont(10F);
+        Padding = new Padding(0);
+        ApplyRoundedWindowRegion();
 
-        var subtitle = new Label
-        {
-            Text = "발로란트 클립 저장 도구",
-            Font = new Font("Segoe UI", 10),
-            ForeColor = Color.FromArgb(190, 190, 200),
-            Left = 107,
-            Top = 66,
-            Width = 420,
-            Height = 24
-        };
+        _titleBar.Left = 0;
+        _titleBar.Top = 0;
+        _titleBar.Width = ClientSize.Width;
+        _titleBar.Height = TitleBarHeight;
+        _titleBar.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+        _titleBar.BackColor = Color.FromArgb(18, 19, 25);
+        _titleBar.MouseDown += DragWindow;
 
-        _logoBox.Left = 26;
-        _logoBox.Top = 25;
-        _logoBox.Width = 64;
-        _logoBox.Height = 64;
+        _logoBox.Left = 16;
+        _logoBox.Top = 14;
+        _logoBox.Width = 22;
+        _logoBox.Height = 22;
         _logoBox.SizeMode = PictureBoxSizeMode.Zoom;
         _logoBox.Image = LoadPngResource();
+        _logoBox.MouseDown += DragWindow;
 
-        _statusLabel.Text = "상시녹화 준비 중";
-        _statusLabel.Font = new Font("Segoe UI", 10, FontStyle.Bold);
-        _statusLabel.Left = 530;
-        _statusLabel.Top = 34;
-        _statusLabel.Width = 250;
-        _statusLabel.Height = 24;
-        _statusLabel.TextAlign = ContentAlignment.MiddleRight;
+        var titleLabel = new Label
+        {
+            Text = "ShotLog",
+            Left = 46,
+            Top = 0,
+            Width = 180,
+            Height = TitleBarHeight,
+            Font = UiFont(11F, FontStyle.Bold),
+            ForeColor = Color.FromArgb(246, 247, 251),
+            BackColor = Color.Transparent,
+            TextAlign = ContentAlignment.MiddleLeft
+        };
+        titleLabel.MouseDown += DragWindow;
 
-        _engineLabel.Text = "캡처 엔진 : 대기 중";
-        _engineLabel.Font = new Font("Segoe UI", 9);
-        _engineLabel.ForeColor = Color.FromArgb(190, 190, 200);
-        _engineLabel.Left = 430;
-        _engineLabel.Top = 62;
-        _engineLabel.Width = 350;
-        _engineLabel.Height = 24;
-        _engineLabel.TextAlign = ContentAlignment.MiddleRight;
+        _statusLabel.Text = "자동 녹화 준비 중 ●";
+        _statusLabel.Font = UiFont(9.5F, FontStyle.Bold);
+        _statusLabel.Width = 210;
+        _statusLabel.Height = 30;
+        _statusLabel.Top = 10;
+        _statusLabel.TextAlign = ContentAlignment.MiddleCenter;
+        _statusLabel.BackColor = Color.FromArgb(20, 31, 34);
+        _statusLabel.ForeColor = AccentColor;
+        _statusLabel.MouseDown += DragWindow;
 
-        _hotkeyInfoLabel.Text = "클립 저장 단축키 : F8";
-        _hotkeyInfoLabel.Left = 26;
-        _hotkeyInfoLabel.Top = 108;
-        _hotkeyInfoLabel.Width = 330;
-        _hotkeyInfoLabel.Height = 24;
-        _hotkeyInfoLabel.ForeColor = Color.FromArgb(220, 220, 230);
+        _closeButton.Text = "×";
+        _closeButton.Left = ClientSize.Width - 50;
+        _closeButton.Top = 0;
+        _closeButton.Width = 50;
+        _closeButton.Height = TitleBarHeight;
+        _closeButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+        _closeButton.FlatStyle = FlatStyle.Flat;
+        _closeButton.FlatAppearance.BorderSize = 0;
+        _closeButton.FlatAppearance.MouseOverBackColor = Color.FromArgb(31, 34, 44);
+        _closeButton.FlatAppearance.MouseDownBackColor = Color.FromArgb(42, 45, 58);
+        _closeButton.BackColor = Color.FromArgb(18, 19, 25);
+        _closeButton.ForeColor = Color.FromArgb(236, 238, 246);
+        _closeButton.Font = UiFont(15F, FontStyle.Bold);
+        _closeButton.Cursor = Cursors.Hand;
+        _closeButton.TabStop = false;
+        _closeButton.Click += (_, _) => Close();
 
-        _trayInfoLabel.Text = "프로그램 종료 시 시스템 트레이로 최소화됩니다.";
-        _trayInfoLabel.Left = 390;
-        _trayInfoLabel.Top = 108;
-        _trayInfoLabel.Width = 390;
-        _trayInfoLabel.Height = 24;
-        _trayInfoLabel.ForeColor = Color.FromArgb(190, 190, 200);
-        _trayInfoLabel.TextAlign = ContentAlignment.MiddleRight;
+        _titleBar.Controls.AddRange(new Control[] { _logoBox, titleLabel, _statusLabel, _closeButton });
+        Controls.Add(_titleBar);
+        CenterTitleStatus();
+        RefreshStatusBadge();
 
-        var captureBox = CreateGroupBox("상시녹화 설정", 22, 142, 758, 160);
-        AddLabel(captureBox, "저장할 이전 초", 18, 32, 120);
-        _secondsInput.Left = 138;
-        _secondsInput.Top = 28;
-        _secondsInput.Width = 80;
-        _secondsInput.Minimum = 5;
-        _secondsInput.Maximum = 120;
-
-        AddLabel(captureBox, "FPS", 240, 32, 50);
-        _fpsInput.Left = 290;
-        _fpsInput.Top = 28;
-        _fpsInput.Width = 80;
-        _fpsInput.Minimum = 30;
-        _fpsInput.Maximum = 144;
-
-        AddLabel(captureBox, "비트레이트 Mbps", 392, 32, 115);
-        _bitrateInput.Left = 508;
-        _bitrateInput.Top = 28;
-        _bitrateInput.Width = 80;
-        _bitrateInput.Minimum = 5;
-        _bitrateInput.Maximum = 80;
-
-        AddLabel(captureBox, "캡처 방식", 18, 76, 80);
-        _engineCombo.Left = 100;
-        _engineCombo.Top = 72;
-        _engineCombo.Width = 180;
-        _engineCombo.DropDownStyle = ComboBoxStyle.DropDownList;
-        _engineCombo.Items.AddRange(new object[] { "자동", "고성능(DDA)", "호환(GDI)" });
-
-        _audioCheck.Text = "오디오 녹음 사용";
-        _audioCheck.Left = 310;
-        _audioCheck.Top = 74;
-        _audioCheck.Width = 135;
-        _audioCheck.ForeColor = Color.White;
-
-        _mouseCheck.Text = "마우스 커서 포함";
-        _mouseCheck.Left = 470;
-        _mouseCheck.Top = 74;
-        _mouseCheck.Width = 145;
-        _mouseCheck.ForeColor = Color.White;
+        var heroBox = CreateGroupBox("클립 저장", 24, 70, 792, 150);
+        _saveButton.Text = "지금 클립 저장";
+        _saveButton.Left = 20;
+        _saveButton.Top = 46;
+        _saveButton.Width = 220;
+        _saveButton.Height = 56;
+        _saveButton.Font = UiFont(13F, FontStyle.Bold);
+        _saveButton.Click += (_, _) => _ = SaveClipAsync("button");
 
         _toggleRecordButton.Text = "상시녹화 시작";
-        _toggleRecordButton.Left = 18;
-        _toggleRecordButton.Top = 112;
-        _toggleRecordButton.Width = 140;
-        _toggleRecordButton.Height = 34;
+        _toggleRecordButton.Left = 258;
+        _toggleRecordButton.Top = 52;
+        _toggleRecordButton.Width = 150;
+        _toggleRecordButton.Height = 44;
         _toggleRecordButton.Click += async (_, _) =>
         {
             if (_recording)
@@ -428,201 +468,280 @@ internal sealed class MainForm : Form
             }
         };
 
-        _saveButton.Text = "지금 클립 저장";
-        _saveButton.Left = 170;
-        _saveButton.Top = 112;
-        _saveButton.Width = 140;
-        _saveButton.Height = 34;
-        _saveButton.Click += (_, _) => _ = SaveClipAsync("button");
-
         _availableLabel.Text = "저장 가능 영상 : 0초 / 30초";
-        _availableLabel.Left = 330;
-        _availableLabel.Top = 117;
-        _availableLabel.Width = 390;
+        _availableLabel.Left = 438;
+        _availableLabel.Top = 48;
+        _availableLabel.Width = 326;
         _availableLabel.Height = 24;
-        _availableLabel.ForeColor = Color.FromArgb(210, 210, 220);
+        _availableLabel.Font = UiFont(9.5F, FontStyle.Bold);
+        _availableLabel.ForeColor = Color.FromArgb(226, 228, 236);
         _availableLabel.TextAlign = ContentAlignment.MiddleRight;
+
+        _availableProgress.Left = 438;
+        _availableProgress.Top = 82;
+        _availableProgress.Width = 326;
+        _availableProgress.Height = 12;
+        _availableProgress.MaximumValue = 30;
+        _availableProgress.CurrentValue = 0;
+
+        _hotkeyInfoLabel.Text = "클립 저장 단축키 : F8";
+        _hotkeyInfoLabel.Left = 20;
+        _hotkeyInfoLabel.Top = 114;
+        _hotkeyInfoLabel.Width = 330;
+        _hotkeyInfoLabel.Height = 24;
+        _hotkeyInfoLabel.ForeColor = Color.FromArgb(165, 169, 184);
+        _hotkeyInfoLabel.Font = UiFont(9F);
+
+        _engineLabel.Text = "캡처 엔진 : 대기 중";
+        _engineLabel.Font = UiFont(9F);
+        _engineLabel.ForeColor = Color.FromArgb(135, 140, 155);
+        _engineLabel.Left = 438;
+        _engineLabel.Top = 114;
+        _engineLabel.Width = 326;
+        _engineLabel.Height = 24;
+        _engineLabel.TextAlign = ContentAlignment.MiddleRight;
+
+        heroBox.Controls.AddRange(new Control[]
+        {
+            _saveButton, _toggleRecordButton, _availableLabel, _availableProgress, _hotkeyInfoLabel, _engineLabel
+        });
+
+        var captureBox = CreateGroupBox("클립 설정", 24, 240, 384, 204);
+        AddLabel(captureBox, "저장 길이", 18, 42, 92);
+        _secondsInput.Left = 18;
+        _secondsInput.Top = 65;
+        _secondsInput.Width = 92;
+        _secondsInput.Minimum = 5;
+        _secondsInput.Maximum = 120;
+
+        AddLabel(captureBox, "FPS", 132, 42, 92);
+        _fpsInput.Left = 132;
+        _fpsInput.Top = 65;
+        _fpsInput.Width = 92;
+        _fpsInput.Minimum = 30;
+        _fpsInput.Maximum = 144;
+
+        AddLabel(captureBox, "비트레이트", 246, 42, 110);
+        _bitrateInput.Left = 246;
+        _bitrateInput.Top = 65;
+        _bitrateInput.Width = 92;
+        _bitrateInput.Minimum = 5;
+        _bitrateInput.Maximum = 80;
+
+        AddLabel(captureBox, "캡처 방식", 18, 112, 90);
+        _engineCombo.Left = 18;
+        _engineCombo.Top = 135;
+        _engineCombo.Width = 172;
+        _engineCombo.DropDownStyle = ComboBoxStyle.DropDownList;
+        _engineCombo.Items.AddRange(new object[] { "자동", "고성능(DDA)", "호환(GDI)" });
+
+        _mouseCheck.Text = "마우스 커서 포함";
+        _mouseCheck.Left = 216;
+        _mouseCheck.Top = 137;
+        _mouseCheck.Width = 145;
+        _mouseCheck.ForeColor = Color.FromArgb(224, 226, 234);
 
         captureBox.Controls.AddRange(new Control[]
         {
-            _secondsInput, _fpsInput, _bitrateInput, _engineCombo, _audioCheck, _mouseCheck,
-            _toggleRecordButton, _saveButton, _availableLabel
+            _secondsInput, _fpsInput, _bitrateInput, _engineCombo, _mouseCheck
         });
 
-        var audioBox = CreateGroupBox("오디오 설정", 22, 316, 758, 210);
-        AddLabel(audioBox, "출력 장치", 18, 30, 80);
+        var audioBox = CreateGroupBox("오디오 설정", 432, 240, 384, 204);
+        _audioCheck.Text = "오디오 녹음 사용";
+        _audioCheck.Left = 18;
+        _audioCheck.Top = 40;
+        _audioCheck.Width = 140;
+        _audioCheck.ForeColor = Color.FromArgb(224, 226, 234);
+
+        AddLabel(audioBox, "출력 장치", 18, 68, 80);
         _outputDeviceList.Left = 18;
-        _outputDeviceList.Top = 54;
-        _outputDeviceList.Width = 340;
+        _outputDeviceList.Top = 91;
+        _outputDeviceList.Width = 348;
         _outputDeviceList.Height = 32;
         _outputDeviceList.DropDownStyle = ComboBoxStyle.DropDownList;
-        _outputDeviceList.BackColor = Color.FromArgb(10, 11, 15);
-        _outputDeviceList.ForeColor = Color.FromArgb(225, 225, 230);
 
-        AddLabel(audioBox, "마이크", 382, 30, 80);
-        _micDeviceList.Left = 382;
-        _micDeviceList.Top = 54;
-        _micDeviceList.Width = 340;
+        AddLabel(audioBox, "마이크", 18, 126, 70);
+        _micDeviceList.Left = 18;
+        _micDeviceList.Top = 149;
+        _micDeviceList.Width = 168;
         _micDeviceList.Height = 32;
         _micDeviceList.DropDownStyle = ComboBoxStyle.DropDownList;
-        _micDeviceList.BackColor = Color.FromArgb(10, 11, 15);
-        _micDeviceList.ForeColor = Color.FromArgb(225, 225, 230);
 
-        AddLabel(audioBox, "소리 동기 보정(ms)", 18, 138, 130);
-        _audioDelayInput.Left = 154;
-        _audioDelayInput.Top = 134;
-        _audioDelayInput.Width = 90;
+        AddLabel(audioBox, "동기(ms)", 204, 126, 70);
+        _audioDelayInput.Left = 204;
+        _audioDelayInput.Top = 149;
+        _audioDelayInput.Width = 72;
         _audioDelayInput.Minimum = -5000;
         _audioDelayInput.Maximum = 5000;
         _audioDelayInput.Increment = 100;
 
-        AddLabel(audioBox, "마이크 볼륨(%)", 270, 138, 100);
-        _micVolumeInput.Left = 382;
-        _micVolumeInput.Top = 134;
-        _micVolumeInput.Width = 90;
+        AddLabel(audioBox, "볼륨(%)", 294, 126, 70);
+        _micVolumeInput.Left = 294;
+        _micVolumeInput.Top = 149;
+        _micVolumeInput.Width = 72;
         _micVolumeInput.Minimum = 50;
         _micVolumeInput.Maximum = 500;
         _micVolumeInput.Increment = 10;
 
-        _micTestButton.Text = "마이크 테스트 시작";
-        _micTestButton.Left = 18;
-        _micTestButton.Top = 170;
-        _micTestButton.Width = 220;
+        _micTestButton.Text = "마이크 테스트";
+        _micTestButton.Left = 160;
+        _micTestButton.Top = 38;
+        _micTestButton.Width = 112;
         _micTestButton.Height = 30;
         _micTestButton.Click += (_, _) => ToggleMicTest();
 
-        _refreshAudioDevicesButton.Text = "오디오 장치 새로고침";
-        _refreshAudioDevicesButton.Left = 382;
-        _refreshAudioDevicesButton.Top = 170;
-        _refreshAudioDevicesButton.Width = 340;
+        _refreshAudioDevicesButton.Text = "새로고침";
+        _refreshAudioDevicesButton.Left = 280;
+        _refreshAudioDevicesButton.Top = 38;
+        _refreshAudioDevicesButton.Width = 86;
         _refreshAudioDevicesButton.Height = 30;
         _refreshAudioDevicesButton.Click += (_, _) => LoadAudioDevicesToUi(true);
 
         audioBox.Controls.AddRange(new Control[]
         {
-            _outputDeviceList, _micDeviceList, _audioDelayInput, _micVolumeInput, _micTestButton, _refreshAudioDevicesButton
+            _audioCheck, _outputDeviceList, _micDeviceList, _audioDelayInput, _micVolumeInput,
+            _micTestButton, _refreshAudioDevicesButton
         });
 
-        var hotkeyBox = CreateGroupBox("단축키 설정", 22, 542, 370, 112);
-        AddLabel(hotkeyBox, "현재 단축키", 18, 32, 100);
-
+        var shortcutBox = CreateGroupBox("단축키", 24, 464, 384, 112);
+        AddLabel(shortcutBox, "현재 단축키", 18, 42, 100);
         var hotkeyPreviewLabel = new Label
         {
-            Left = 120,
-            Top = 32,
-            Width = 220,
+            Left = 118,
+            Top = 42,
+            Width = 238,
             Height = 24,
-            ForeColor = Color.FromArgb(220, 220, 230)
+            ForeColor = Color.FromArgb(226, 228, 236),
+            TextAlign = ContentAlignment.MiddleRight,
+            Font = UiFont(9F)
         };
         hotkeyPreviewLabel.DataBindings.Add("Text", _hotkeyInfoLabel, "Text");
 
-        _recordHotkeyButton.Text = "단축키 녹화";
+        _recordHotkeyButton.Text = "단축키 변경";
         _recordHotkeyButton.Left = 18;
-        _recordHotkeyButton.Top = 68;
-        _recordHotkeyButton.Width = 322;
+        _recordHotkeyButton.Top = 72;
+        _recordHotkeyButton.Width = 338;
         _recordHotkeyButton.Height = 30;
         _recordHotkeyButton.Click += (_, _) => BeginHotkeyRecording();
 
-        hotkeyBox.Controls.AddRange(new Control[] { hotkeyPreviewLabel, _recordHotkeyButton });
+        shortcutBox.Controls.AddRange(new Control[]
+        {
+            hotkeyPreviewLabel, _recordHotkeyButton
+        });
 
-        var folderBox = CreateGroupBox("저장 폴더", 410, 542, 370, 112);
+        var folderBox = CreateGroupBox("저장 위치", 432, 464, 384, 112);
+        AddLabel(folderBox, "현재 저장 위치", 18, 42, 120);
         _folderLabel.Text = "";
-        _folderLabel.Left = 18;
-        _folderLabel.Top = 28;
-        _folderLabel.Width = 322;
-        _folderLabel.Height = 32;
-        _folderLabel.ForeColor = Color.FromArgb(200, 200, 210);
+        _folderLabel.Left = 132;
+        _folderLabel.Top = 42;
+        _folderLabel.Width = 224;
+        _folderLabel.Height = 24;
+        _folderLabel.ForeColor = Color.FromArgb(164, 168, 183);
+        _folderLabel.TextAlign = ContentAlignment.MiddleRight;
+        _folderLabel.Font = UiFont(9F);
 
-        _openFolderButton.Text = "저장 폴더 열기";
+        _openFolderButton.Text = "폴더 열기";
         _openFolderButton.Left = 18;
-        _openFolderButton.Top = 68;
-        _openFolderButton.Width = 150;
+        _openFolderButton.Top = 72;
+        _openFolderButton.Width = 164;
         _openFolderButton.Height = 30;
         _openFolderButton.Click += (_, _) => Process.Start(new ProcessStartInfo(_settings.OutputFolder) { UseShellExecute = true });
 
-        _setFolderButton.Text = "저장 폴더 설정";
-        _setFolderButton.Left = 188;
-        _setFolderButton.Top = 68;
-        _setFolderButton.Width = 150;
+        _setFolderButton.Text = "저장 위치 변경";
+        _setFolderButton.Left = 194;
+        _setFolderButton.Top = 72;
+        _setFolderButton.Width = 162;
         _setFolderButton.Height = 30;
         _setFolderButton.Click += (_, _) => SetOutputFolder();
 
-        folderBox.Controls.AddRange(new Control[] { _folderLabel, _openFolderButton, _setFolderButton });
+        folderBox.Controls.AddRange(new Control[]
+        {
+            _folderLabel, _openFolderButton, _setFolderButton
+        });
 
-        var updateBox = CreateGroupBox("자동 업데이트", 22, 668, 758, 96);
-        AddLabel(updateBox, "GitHub 소유자", 18, 32, 95);
-        _githubOwnerBox.Left = 112;
-        _githubOwnerBox.Top = 28;
-        _githubOwnerBox.Width = 160;
-
-        AddLabel(updateBox, "저장소", 292, 32, 55);
-        _githubRepoBox.Left = 348;
-        _githubRepoBox.Top = 28;
-        _githubRepoBox.Width = 160;
-
+        var updateBox = CreateGroupBox("업데이트", 24, 588, 792, 70);
         _checkUpdatesOnStartCheck.Text = "시작 시 업데이트 확인";
         _checkUpdatesOnStartCheck.Left = 18;
-        _checkUpdatesOnStartCheck.Top = 64;
-        _checkUpdatesOnStartCheck.Width = 170;
-        _checkUpdatesOnStartCheck.ForeColor = Color.White;
+        _checkUpdatesOnStartCheck.Top = 36;
+        _checkUpdatesOnStartCheck.Width = 230;
+        _checkUpdatesOnStartCheck.ForeColor = Color.FromArgb(224, 226, 234);
         _checkUpdatesOnStartCheck.CheckedChanged += (_, _) => SaveUiSettings();
 
         _checkUpdateButton.Text = "업데이트 확인";
-        _checkUpdateButton.Left = 570;
+        _checkUpdateButton.Left = 634;
         _checkUpdateButton.Top = 28;
-        _checkUpdateButton.Width = 150;
-        _checkUpdateButton.Height = 34;
+        _checkUpdateButton.Width = 140;
+        _checkUpdateButton.Height = 32;
         _checkUpdateButton.Click += async (_, _) =>
         {
             SaveUiSettings();
             await CheckForUpdatesAsync(true);
         };
 
-        updateBox.Controls.AddRange(new Control[] { _githubOwnerBox, _githubRepoBox, _checkUpdatesOnStartCheck, _checkUpdateButton });
+        updateBox.Controls.AddRange(new Control[]
+        {
+            _checkUpdatesOnStartCheck, _checkUpdateButton
+        });
 
-        var logBox = CreateGroupBox("로그", 22, 778, 758, 106);
+        var logBox = CreateGroupBox("최근 로그", 24, 678, 792, 96);
+        _exportLogButton.Text = "로그 출력";
+        _exportLogButton.Left = 672;
+        _exportLogButton.Top = 10;
+        _exportLogButton.Width = 102;
+        _exportLogButton.Height = 30;
+        _exportLogButton.Click += (_, _) => ExportLogFile();
+
         _logBox.Left = 18;
-        _logBox.Top = 26;
-        _logBox.Width = 722;
-        _logBox.Height = 64;
+        _logBox.Top = 42;
+        _logBox.Width = 756;
+        _logBox.Height = 38;
         _logBox.Multiline = true;
         _logBox.ReadOnly = true;
         _logBox.ScrollBars = ScrollBars.Vertical;
-        _logBox.BackColor = Color.FromArgb(10, 11, 15);
-        _logBox.ForeColor = Color.FromArgb(225, 225, 230);
-        _logBox.BorderStyle = BorderStyle.FixedSingle;
-        logBox.Controls.Add(_logBox);
+        _logBox.BackColor = Color.FromArgb(12, 13, 18);
+        _logBox.ForeColor = Color.FromArgb(215, 218, 228);
+        _logBox.BorderStyle = BorderStyle.None;
+        _logBox.Font = UiFont(9F);
+        logBox.Controls.AddRange(new Control[] { _exportLogButton, _logBox });
+        _exportLogButton.BringToFront();
 
         Controls.AddRange(new Control[]
         {
-            _logoBox, title, subtitle, _statusLabel, _engineLabel, _hotkeyInfoLabel, _trayInfoLabel,
-            captureBox, audioBox, hotkeyBox, folderBox, updateBox, logBox
+            heroBox, captureBox, audioBox, shortcutBox, folderBox, updateBox, logBox
         });
 
-        foreach (var button in GetAllControls(this).OfType<Button>())
-        {
-            button.BackColor = Color.FromArgb(255, 70, 85);
-            button.ForeColor = Color.White;
-            button.FlatStyle = FlatStyle.Flat;
-            button.FlatAppearance.BorderSize = 0;
-        }
+        ApplyCommonUiStyles();
     }
 
-    private static GroupBox CreateGroupBox(string text, int left, int top, int width, int height)
+    private Panel CreateGroupBox(string text, int left, int top, int width, int height)
     {
-        return new GroupBox
+        var panel = new RoundedPanel
         {
-            Text = text,
             Left = left,
             Top = top,
             Width = width,
             Height = height,
-            ForeColor = Color.FromArgb(225, 225, 230),
-            BackColor = Color.FromArgb(18, 19, 25)
+            BackColor = Color.FromArgb(24, 26, 35),
+            BorderStyle = BorderStyle.None,
+            CornerRadius = 6
         };
+
+        panel.Controls.Add(new Label
+        {
+            Text = text,
+            Left = 18,
+            Top = 12,
+            Width = width - 36,
+            Height = 24,
+            Font = UiFont(10F, FontStyle.Bold),
+            ForeColor = Color.FromArgb(242, 243, 248),
+            BackColor = Color.Transparent
+        });
+
+        return panel;
     }
 
-    private static void AddLabel(Control parent, string text, int left, int top, int width)
+    private void AddLabel(Control parent, string text, int left, int top, int width)
     {
         parent.Controls.Add(new Label
         {
@@ -630,9 +749,58 @@ internal sealed class MainForm : Form
             Left = left,
             Top = top,
             Width = width,
-            Height = 24,
-            ForeColor = Color.FromArgb(210, 210, 220)
+            Height = 22,
+            Font = UiFont(8.5F),
+            ForeColor = Color.FromArgb(148, 152, 168),
+            BackColor = Color.Transparent
         });
+    }
+
+    private void ApplyCommonUiStyles()
+    {
+        foreach (var button in GetAllControls(this).OfType<Button>())
+        {
+            button.BackColor = Color.FromArgb(43, 46, 59);
+            button.ForeColor = Color.FromArgb(246, 247, 251);
+            button.FlatStyle = FlatStyle.Flat;
+            button.FlatAppearance.BorderSize = 0;
+            button.FlatAppearance.MouseOverBackColor = Color.FromArgb(52, 56, 70);
+            button.FlatAppearance.MouseDownBackColor = Color.FromArgb(62, 66, 82);
+            button.Font = UiFont(9F, FontStyle.Bold);
+            button.Cursor = Cursors.Hand;
+            button.UseVisualStyleBackColor = false;
+        }
+
+        _saveButton.BackColor = AccentColor;
+        _saveButton.ForeColor = Color.FromArgb(5, 18, 45);
+
+        _closeButton.BackColor = Color.FromArgb(18, 19, 25);
+        _closeButton.ForeColor = Color.FromArgb(236, 238, 246);
+        _closeButton.Font = UiFont(15F, FontStyle.Bold);
+        _closeButton.FlatAppearance.MouseOverBackColor = Color.FromArgb(31, 34, 44);
+        _closeButton.FlatAppearance.MouseDownBackColor = Color.FromArgb(42, 45, 58);
+        _closeButton.TabStop = false;
+
+        foreach (var input in GetAllControls(this).Where(control => control is TextBox or ComboBox or NumericUpDown))
+        {
+            input.BackColor = Color.FromArgb(12, 13, 18);
+            input.ForeColor = Color.FromArgb(232, 234, 242);
+            input.Font = UiFont(9F);
+        }
+
+        foreach (var check in GetAllControls(this).OfType<CheckBox>())
+        {
+            check.BackColor = Color.Transparent;
+            check.ForeColor = Color.FromArgb(224, 226, 234);
+            check.Font = UiFont(9F);
+        }
+
+        foreach (var label in GetAllControls(this).OfType<Label>())
+        {
+            label.UseCompatibleTextRendering = true;
+        }
+
+        RefreshStatusBadge();
     }
 
     private static IEnumerable<Control> GetAllControls(Control parent)
@@ -644,6 +812,98 @@ internal sealed class MainForm : Form
             {
                 yield return child;
             }
+        }
+    }
+
+    private void CenterTitleStatus()
+    {
+        if (_statusLabel.IsDisposed)
+        {
+            return;
+        }
+
+        _statusLabel.Left = Math.Max(230, (ClientSize.Width - _statusLabel.Width) / 2);
+    }
+
+    private void DragWindow(object? sender, MouseEventArgs e)
+    {
+        if (e.Button != MouseButtons.Left)
+        {
+            return;
+        }
+
+        ReleaseCapture();
+        SendMessage(Handle, WmNcLButtonDown, HtCaption, 0);
+    }
+
+    private Font UiFont(float size, FontStyle style = FontStyle.Regular)
+    {
+        const float fontBoost = 1.0F;
+        var safeStyle = _uiFontFamily.IsStyleAvailable(style) ? style : FontStyle.Regular;
+        return new Font(_uiFontFamily, size + fontBoost, safeStyle);
+    }
+
+    private void SetStatusText(string text)
+    {
+        _statusLabel.Text = text;
+        RefreshStatusBadge();
+    }
+
+    private void RefreshStatusBadge()
+    {
+        if (_statusLabel.IsDisposed)
+        {
+            return;
+        }
+
+        var text = _statusLabel.Text;
+        if (text.Contains("활성화", StringComparison.Ordinal) && !text.Contains("비활성화", StringComparison.Ordinal))
+        {
+            _statusLabel.ForeColor = ActiveStatusColor;
+            _statusLabel.BackColor = Color.FromArgb(16, 39, 34);
+        }
+        else if (text.Contains("비활성화", StringComparison.Ordinal) || text.Contains("실패", StringComparison.Ordinal) || text.Contains("중단", StringComparison.Ordinal))
+        {
+            _statusLabel.ForeColor = InactiveStatusColor;
+            _statusLabel.BackColor = Color.FromArgb(42, 23, 31);
+        }
+        else if (text.Contains("저장", StringComparison.Ordinal) || text.Contains("시작", StringComparison.Ordinal) || text.Contains("준비", StringComparison.Ordinal))
+        {
+            _statusLabel.ForeColor = WarningStatusColor;
+            _statusLabel.BackColor = Color.FromArgb(43, 35, 21);
+        }
+        else
+        {
+            _statusLabel.ForeColor = AccentColor;
+            _statusLabel.BackColor = Color.FromArgb(20, 31, 34);
+        }
+
+        _statusLabel.Invalidate();
+    }
+
+    private FontFamily LoadUiFontFamily()
+    {
+        try
+        {
+            using var resource = Assembly.GetExecutingAssembly().GetManifestResourceStream("OngeulipBerryRyowon.ttf");
+            if (resource == null)
+            {
+                return new FontFamily("Segoe UI");
+            }
+
+            using var ms = new MemoryStream();
+            resource.CopyTo(ms);
+            var data = ms.ToArray();
+            var ptr = Marshal.AllocCoTaskMem(data.Length);
+            Marshal.Copy(data, 0, ptr, data.Length);
+            _privateFonts.AddMemoryFont(ptr, data.Length);
+            _fontMemory.Add(ptr);
+
+            return _privateFonts.Families.Length > 0 ? _privateFonts.Families[0] : new FontFamily("Segoe UI");
+        }
+        catch
+        {
+            return new FontFamily("Segoe UI");
         }
     }
 
@@ -688,10 +948,8 @@ internal sealed class MainForm : Form
 
         _audioDelayInput.Value = Clamp(_settings.AudioDelayMs, -AudioDelayLimitMs, AudioDelayLimitMs);
         _micVolumeInput.Value = Clamp(_settings.MicVolumePercent, 50, 500);
-        _githubOwnerBox.Text = _settings.GitHubOwner;
-        _githubRepoBox.Text = _settings.GitHubRepo;
         _checkUpdatesOnStartCheck.Checked = _settings.CheckUpdatesOnStart;
-        _folderLabel.Text = ShortenPath(_settings.OutputFolder, 46);
+        _folderLabel.Text = ShortenPath(_settings.OutputFolder, 42);
         LoadAudioDevicesToUi(false);
         UpdateHotkeyLabel();
     }
@@ -717,8 +975,6 @@ internal sealed class MainForm : Form
             2 => "gdi",
             _ => "auto"
         };
-        _settings.GitHubOwner = _githubOwnerBox.Text.Trim();
-        _settings.GitHubRepo = _githubRepoBox.Text.Trim();
         _settings.CheckUpdatesOnStart = _checkUpdatesOnStartCheck.Checked;
         _settings.Normalize();
         SaveSettings();
@@ -737,7 +993,7 @@ internal sealed class MainForm : Form
         CleanBufferFolder(true);
         _ffmpegLog.Clear();
         _manualStopping = false;
-        _statusLabel.Text = "상시녹화 시작 중";
+        SetStatusText("자동 녹화 시작 중 ●");
         _engineLabel.Text = "캡처 엔진 : 준비 중";
         _toggleRecordButton.Enabled = false;
 
@@ -757,7 +1013,7 @@ internal sealed class MainForm : Form
                     _recording = true;
                     _recordingStartedAt = DateTime.Now;
                     _activeEngineName = attempt.Name;
-                    _statusLabel.Text = "상시녹화 중";
+                    SetStatusText("자동 녹화 활성화 ●");
                     _engineLabel.Text = "캡처 엔진 : " + attempt.Name;
                     _toggleRecordButton.Text = "상시녹화 중지";
                     _toggleRecordButton.Enabled = true;
@@ -777,7 +1033,7 @@ internal sealed class MainForm : Form
 
         _recording = false;
         _activeEngineName = "실패";
-        _statusLabel.Text = "상시녹화 실패";
+        SetStatusText("자동 녹화 실패 ●");
         _engineLabel.Text = "캡처 엔진 : 실패";
         _toggleRecordButton.Text = "상시녹화 시작";
         _toggleRecordButton.Enabled = true;
@@ -819,7 +1075,7 @@ internal sealed class MainForm : Form
         process?.Dispose();
         _recording = false;
         _activeEngineName = "대기 중";
-        _statusLabel.Text = "상시녹화 중지됨";
+        SetStatusText("자동 녹화 비활성화 ●");
         _engineLabel.Text = "캡처 엔진 : 대기 중";
         _toggleRecordButton.Text = "상시녹화 시작";
         _toggleRecordButton.Enabled = true;
@@ -864,7 +1120,7 @@ internal sealed class MainForm : Form
                     _recording = false;
                     _ffmpegProcess = null;
                     StopAudioCapture();
-                    _statusLabel.Text = "상시녹화 중단됨";
+                    SetStatusText("자동 녹화 중단됨 ●");
                     _engineLabel.Text = "캡처 엔진 : 중단됨";
                     _toggleRecordButton.Text = "상시녹화 시작";
                     Log("FFmpeg 캡처 프로세스가 종료되었습니다. " + GetLastFfmpegLine());
@@ -1515,7 +1771,7 @@ internal sealed class MainForm : Form
 
         _saving = true;
         _saveButton.Enabled = false;
-        _statusLabel.Text = "클립 저장 중";
+        SetStatusText("클립 저장 중 ●");
 
         var segments = segmentInfos.Select(segment => segment.Path).ToList();
         var clipStartUtc = segmentInfos.First().StartUtc;
@@ -1621,7 +1877,7 @@ internal sealed class MainForm : Form
 
             _saving = false;
             _saveButton.Enabled = true;
-            _statusLabel.Text = _recording ? "상시녹화 중" : "상시녹화 중지됨";
+            SetStatusText(_recording ? "자동 녹화 활성화 ●" : "자동 녹화 비활성화 ●");
         }
     }
 
@@ -1648,10 +1904,12 @@ internal sealed class MainForm : Form
         CleanBufferFolder(false);
         var count = GetCompletedSegments().Count;
         var available = Math.Min(BufferSeconds, count);
-        var audioStatus = _settings.IncludeAudio ? (_audioRunning ? $" / 오디오 {_audioSessions.Count}개 녹음 중" : " / 오디오 대기") : "";
-        _availableLabel.Text = $"저장 가능 영상 : {available}초 / {BufferSeconds}초 ({count}개 조각){audioStatus}";
+        _availableLabel.Text = $"저장 가능 영상 : {available}초 / {BufferSeconds}초";
+        _availableProgress.MaximumValue = Math.Max(1, BufferSeconds);
+        _availableProgress.CurrentValue = available;
         _toggleRecordButton.Text = _recording ? "상시녹화 중지" : "상시녹화 시작";
         _engineLabel.Text = "캡처 엔진 : " + _activeEngineName;
+        RefreshStatusBadge();
     }
 
     private List<string> GetCompletedSegments()
@@ -1728,15 +1986,6 @@ internal sealed class MainForm : Form
     {
         SaveUiSettings();
 
-        if (string.IsNullOrWhiteSpace(_settings.GitHubOwner) || string.IsNullOrWhiteSpace(_settings.GitHubRepo))
-        {
-            if (showNoUpdate)
-            {
-                MessageBox.Show("GitHub 소유자와 저장소 이름을 입력해 주세요.", "ShotLog 업데이트", MessageBoxButtons.OK, MessageBoxIcon.Information);
-            }
-            return;
-        }
-
         try
         {
             _checkUpdateButton.Enabled = false;
@@ -1746,7 +1995,7 @@ internal sealed class MainForm : Form
             client.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("ShotLog", Program.AppVersion.ToString()));
             client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/vnd.github+json"));
 
-            var url = $"https://api.github.com/repos/{_settings.GitHubOwner}/{_settings.GitHubRepo}/releases/latest";
+            var url = $"https://api.github.com/repos/{UpdateGitHubOwner}/{UpdateGitHubRepo}/releases/latest";
             var json = await client.GetStringAsync(url);
             using var doc = JsonDocument.Parse(json);
             var root = doc.RootElement;
@@ -1988,7 +2237,7 @@ try { Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContin
         _settings.OutputFolder = dialog.SelectedPath;
         Directory.CreateDirectory(_settings.OutputFolder);
         SaveSettings();
-        _folderLabel.Text = ShortenPath(_settings.OutputFolder, 46);
+        _folderLabel.Text = ShortenPath(_settings.OutputFolder, 42);
         Log("저장 폴더를 변경했습니다.");
     }
 
@@ -2375,9 +2624,44 @@ try { Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContin
     {
         SafeUi(() =>
         {
-            var line = $"[{DateTime.Now:HH:mm:ss}] {message}{Environment.NewLine}";
-            _logBox.AppendText(line);
+            var line = $"[{DateTime.Now:HH:mm:ss}] {message}";
+            _logLines.Add(line);
+            if (_logLines.Count > 1000)
+            {
+                _logLines.RemoveRange(0, _logLines.Count - 1000);
+            }
+            _logBox.AppendText(line + Environment.NewLine);
         });
+    }
+
+    private void ExportLogFile()
+    {
+        try
+        {
+            Directory.CreateDirectory(_settings.OutputFolder);
+
+            using var dialog = new SaveFileDialog
+            {
+                Title = "ShotLog 로그 출력",
+                Filter = "텍스트 파일 (*.txt)|*.txt",
+                FileName = $"ShotLog_log_{DateTime.Now:yyyy-MM-dd_HH-mm-ss}.txt",
+                InitialDirectory = Directory.Exists(_settings.OutputFolder) ? _settings.OutputFolder : AppPaths.DefaultOutputFolder
+            };
+
+            if (dialog.ShowDialog(this) != DialogResult.OK)
+            {
+                return;
+            }
+
+            var lines = _logLines.Count > 0 ? _logLines : _logBox.Lines.Where(line => !string.IsNullOrWhiteSpace(line)).ToList();
+            File.WriteAllLines(dialog.FileName, lines, new UTF8Encoding(true));
+            Log("로그 파일을 출력했습니다: " + Path.GetFileName(dialog.FileName));
+        }
+        catch (Exception ex)
+        {
+            Log("로그 출력 실패: " + ex.Message);
+            MessageBox.Show("로그 출력에 실패했습니다.\n\n" + ex.Message, "ShotLog", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
     }
 
     private void SafeUi(Action action)
@@ -2527,6 +2811,175 @@ try { Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContin
     private readonly record struct CaptureAttempt(string Name, string Arguments);
     private readonly record struct ProcessResult(int ExitCode, string OutputText, string ErrorText);
     private readonly record struct UpdateAsset(string Name, string DownloadUrl);
+}
+
+
+
+
+internal sealed class RoundedPanel : Panel
+{
+    public int CornerRadius { get; set; } = 6;
+
+    public RoundedPanel()
+    {
+        DoubleBuffered = true;
+        SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer, true);
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+        using var path = CreateRoundPath(new Rectangle(0, 0, Width - 1, Height - 1), CornerRadius);
+        using var brush = new SolidBrush(BackColor);
+        e.Graphics.FillPath(brush, path);
+    }
+
+    private static System.Drawing.Drawing2D.GraphicsPath CreateRoundPath(Rectangle bounds, int radius)
+    {
+        var path = new System.Drawing.Drawing2D.GraphicsPath();
+        var diameter = Math.Max(1, radius * 2);
+        path.AddArc(bounds.Left, bounds.Top, diameter, diameter, 180, 90);
+        path.AddArc(bounds.Right - diameter, bounds.Top, diameter, diameter, 270, 90);
+        path.AddArc(bounds.Right - diameter, bounds.Bottom - diameter, diameter, diameter, 0, 90);
+        path.AddArc(bounds.Left, bounds.Bottom - diameter, diameter, diameter, 90, 90);
+        path.CloseFigure();
+        return path;
+    }
+}
+
+internal sealed class TitleCloseButton : Button
+{
+    private bool _hovered;
+    private bool _pressed;
+
+    protected override bool ShowFocusCues => false;
+
+    protected override void OnMouseEnter(EventArgs e)
+    {
+        _hovered = true;
+        Invalidate();
+        base.OnMouseEnter(e);
+    }
+
+    protected override void OnMouseLeave(EventArgs e)
+    {
+        _hovered = false;
+        _pressed = false;
+        Invalidate();
+        base.OnMouseLeave(e);
+    }
+
+    protected override void OnMouseDown(MouseEventArgs mevent)
+    {
+        _pressed = true;
+        Invalidate();
+        base.OnMouseDown(mevent);
+    }
+
+    protected override void OnMouseUp(MouseEventArgs mevent)
+    {
+        _pressed = false;
+        Invalidate();
+        base.OnMouseUp(mevent);
+    }
+
+    protected override void OnPaint(PaintEventArgs pevent)
+    {
+        pevent.Graphics.Clear(_pressed ? Color.FromArgb(42, 45, 58) : _hovered ? Color.FromArgb(31, 34, 44) : Color.FromArgb(18, 19, 25));
+        TextRenderer.DrawText(
+            pevent.Graphics,
+            Text,
+            Font,
+            ClientRectangle,
+            ForeColor,
+            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding
+        );
+    }
+}
+
+internal sealed class BadgeLabel : Label
+{
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+        using var path = CreateRoundPath(new Rectangle(0, 0, Width - 1, Height - 1), Height / 2);
+        using var brush = new SolidBrush(BackColor);
+        e.Graphics.FillPath(brush, path);
+
+        TextRenderer.DrawText(
+            e.Graphics,
+            Text,
+            Font,
+            ClientRectangle,
+            ForeColor,
+            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis
+        );
+    }
+
+    private static System.Drawing.Drawing2D.GraphicsPath CreateRoundPath(Rectangle bounds, int radius)
+    {
+        var path = new System.Drawing.Drawing2D.GraphicsPath();
+        var diameter = radius * 2;
+        path.AddArc(bounds.Left, bounds.Top, diameter, diameter, 180, 90);
+        path.AddArc(bounds.Right - diameter, bounds.Top, diameter, diameter, 270, 90);
+        path.AddArc(bounds.Right - diameter, bounds.Bottom - diameter, diameter, diameter, 0, 90);
+        path.AddArc(bounds.Left, bounds.Bottom - diameter, diameter, diameter, 90, 90);
+        path.CloseFigure();
+        return path;
+    }
+}
+
+internal sealed class ClipProgressBar : Control
+{
+    private int _maximumValue = 1;
+    private int _currentValue;
+
+    public ClipProgressBar()
+    {
+        DoubleBuffered = true;
+        BackColor = Color.FromArgb(12, 13, 18);
+    }
+
+    public int MaximumValue
+    {
+        get => _maximumValue;
+        set
+        {
+            _maximumValue = Math.Max(1, value);
+            if (_currentValue > _maximumValue)
+            {
+                _currentValue = _maximumValue;
+            }
+            Invalidate();
+        }
+    }
+
+    public int CurrentValue
+    {
+        get => _currentValue;
+        set
+        {
+            _currentValue = Math.Max(0, Math.Min(MaximumValue, value));
+            Invalidate();
+        }
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        base.OnPaint(e);
+        e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+
+        var bounds = new Rectangle(0, 0, Width - 1, Height - 1);
+        using var background = new SolidBrush(Color.FromArgb(12, 13, 18));
+        e.Graphics.FillRectangle(background, bounds);
+
+        var fillWidth = MaximumValue <= 0 ? 0 : (int)Math.Round(bounds.Width * (CurrentValue / (double)MaximumValue));
+        if (fillWidth > 0)
+        {
+            using var fill = new SolidBrush(Color.FromArgb(92, 247, 212));
+            e.Graphics.FillRectangle(fill, new Rectangle(bounds.Left, bounds.Top, fillWidth, bounds.Height));
+        }
+    }
 }
 
 internal sealed class AppSettings
