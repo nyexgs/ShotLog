@@ -31,7 +31,7 @@ internal static class Program
             return version;
         }
 
-        return assembly.GetName().Version ?? new Version(0, 8, 0);
+        return assembly.GetName().Version ?? new Version(0, 10, 1);
     }
 
     [STAThread]
@@ -108,7 +108,7 @@ internal sealed class MainForm : Form
     private const int ModControl = 0x0002;
     private const int ModShift = 0x0004;
     private const int ModNoRepeat = 0x4000;
-    private const int AudioDelayBaseMs = 3500;
+    private const int AudioDelayLimitMs = 5000;
 
     private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
 
@@ -170,8 +170,8 @@ internal sealed class MainForm : Form
     private readonly CheckBox _altCheck = new();
     private readonly CheckBox _shiftCheck = new();
     private readonly CheckBox _audioCheck = new();
-    private readonly CheckedListBox _outputDeviceList = new();
-    private readonly CheckedListBox _micDeviceList = new();
+    private readonly ComboBox _outputDeviceList = new();
+    private readonly ComboBox _micDeviceList = new();
     private readonly NumericUpDown _audioDelayInput = new();
     private readonly NumericUpDown _micVolumeInput = new();
     private readonly Button _micTestButton = new();
@@ -454,8 +454,8 @@ internal sealed class MainForm : Form
         _outputDeviceList.Left = 18;
         _outputDeviceList.Top = 54;
         _outputDeviceList.Width = 340;
-        _outputDeviceList.Height = 76;
-        _outputDeviceList.CheckOnClick = true;
+        _outputDeviceList.Height = 32;
+        _outputDeviceList.DropDownStyle = ComboBoxStyle.DropDownList;
         _outputDeviceList.BackColor = Color.FromArgb(10, 11, 15);
         _outputDeviceList.ForeColor = Color.FromArgb(225, 225, 230);
 
@@ -463,8 +463,8 @@ internal sealed class MainForm : Form
         _micDeviceList.Left = 382;
         _micDeviceList.Top = 54;
         _micDeviceList.Width = 340;
-        _micDeviceList.Height = 76;
-        _micDeviceList.CheckOnClick = true;
+        _micDeviceList.Height = 32;
+        _micDeviceList.DropDownStyle = ComboBoxStyle.DropDownList;
         _micDeviceList.BackColor = Color.FromArgb(10, 11, 15);
         _micDeviceList.ForeColor = Color.FromArgb(225, 225, 230);
 
@@ -472,7 +472,7 @@ internal sealed class MainForm : Form
         _audioDelayInput.Left = 154;
         _audioDelayInput.Top = 134;
         _audioDelayInput.Width = 90;
-        _audioDelayInput.Minimum = -3500;
+        _audioDelayInput.Minimum = -5000;
         _audioDelayInput.Maximum = 5000;
         _audioDelayInput.Increment = 100;
 
@@ -686,7 +686,7 @@ internal sealed class MainForm : Form
             _ => 0
         };
 
-        _audioDelayInput.Value = Clamp(_settings.AudioDelayMs, -3500, 5000);
+        _audioDelayInput.Value = Clamp(_settings.AudioDelayMs, -AudioDelayLimitMs, AudioDelayLimitMs);
         _micVolumeInput.Value = Clamp(_settings.MicVolumePercent, 50, 500);
         _githubOwnerBox.Text = _settings.GitHubOwner;
         _githubRepoBox.Text = _settings.GitHubRepo;
@@ -702,8 +702,12 @@ internal sealed class MainForm : Form
         _settings.Fps = Fps;
         _settings.BitrateMbps = BitrateMbps;
         _settings.IncludeAudio = _audioCheck.Checked;
-        _settings.OutputDeviceIds = _outputDeviceList.CheckedItems.OfType<AudioDeviceItem>().Select(item => item.Id).ToList();
-        _settings.MicDeviceIds = _micDeviceList.CheckedItems.OfType<AudioDeviceItem>().Select(item => item.Id).ToList();
+        _settings.OutputDeviceIds = _outputDeviceList.SelectedItem is AudioDeviceItem outputItem && !string.IsNullOrWhiteSpace(outputItem.Id)
+            ? new List<string> { outputItem.Id }
+            : new List<string>();
+        _settings.MicDeviceIds = _micDeviceList.SelectedItem is AudioDeviceItem micItem && !string.IsNullOrWhiteSpace(micItem.Id)
+            ? new List<string> { micItem.Id }
+            : new List<string>();
         _settings.AudioDelayMs = (int)_audioDelayInput.Value;
         _settings.MicVolumePercent = (int)_micVolumeInput.Value;
         _settings.DrawMouse = _mouseCheck.Checked;
@@ -932,17 +936,17 @@ internal sealed class MainForm : Form
 
     private void LoadAudioDevicesToUi(bool log)
     {
-        var previousOutputIds = _outputDeviceList.CheckedItems.OfType<AudioDeviceItem>().Select(item => item.Id).ToHashSet();
-        var previousMicIds = _micDeviceList.CheckedItems.OfType<AudioDeviceItem>().Select(item => item.Id).ToHashSet();
+        var previousOutputId = _outputDeviceList.SelectedItem is AudioDeviceItem selectedOutput ? selectedOutput.Id : string.Empty;
+        var previousMicId = _micDeviceList.SelectedItem is AudioDeviceItem selectedMic ? selectedMic.Id : string.Empty;
 
-        if (previousOutputIds.Count == 0)
+        if (string.IsNullOrWhiteSpace(previousOutputId))
         {
-            previousOutputIds = _settings.OutputDeviceIds.ToHashSet();
+            previousOutputId = _settings.OutputDeviceIds.FirstOrDefault() ?? string.Empty;
         }
 
-        if (previousMicIds.Count == 0)
+        if (string.IsNullOrWhiteSpace(previousMicId))
         {
-            previousMicIds = _settings.MicDeviceIds.ToHashSet();
+            previousMicId = _settings.MicDeviceIds.FirstOrDefault() ?? string.Empty;
         }
 
         _outputDevices.Clear();
@@ -963,21 +967,52 @@ internal sealed class MainForm : Form
             {
             }
 
+            var selectedOutputIndex = -1;
+            var defaultOutputIndex = -1;
+
             foreach (var device in enumerator.EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active))
             {
                 var item = new AudioDeviceItem(device.ID, device.FriendlyName, false);
                 _outputDevices.Add(item);
                 var index = _outputDeviceList.Items.Add(item);
-                var shouldCheck = previousOutputIds.Count > 0 ? previousOutputIds.Contains(item.Id) : item.Id == defaultOutputId;
-                _outputDeviceList.SetItemChecked(index, shouldCheck);
+
+                if (string.Equals(item.Id, previousOutputId, StringComparison.OrdinalIgnoreCase))
+                {
+                    selectedOutputIndex = index;
+                }
+
+                if (string.Equals(item.Id, defaultOutputId, StringComparison.OrdinalIgnoreCase))
+                {
+                    defaultOutputIndex = index;
+                }
             }
+
+            if (_outputDeviceList.Items.Count > 0)
+            {
+                _outputDeviceList.SelectedIndex = selectedOutputIndex >= 0
+                    ? selectedOutputIndex
+                    : defaultOutputIndex >= 0 ? defaultOutputIndex : 0;
+            }
+
+            var noMicItem = new AudioDeviceItem(string.Empty, "마이크 사용 안 함", true);
+            _micDeviceList.Items.Add(noMicItem);
+            var selectedMicIndex = 0;
 
             foreach (var device in enumerator.EnumerateAudioEndPoints(DataFlow.Capture, DeviceState.Active))
             {
                 var item = new AudioDeviceItem(device.ID, device.FriendlyName, true);
                 _micDevices.Add(item);
                 var index = _micDeviceList.Items.Add(item);
-                _micDeviceList.SetItemChecked(index, previousMicIds.Contains(item.Id));
+
+                if (string.Equals(item.Id, previousMicId, StringComparison.OrdinalIgnoreCase))
+                {
+                    selectedMicIndex = index;
+                }
+            }
+
+            if (_micDeviceList.Items.Count > 0)
+            {
+                _micDeviceList.SelectedIndex = selectedMicIndex;
             }
 
             if (log)
@@ -1270,22 +1305,24 @@ internal sealed class MainForm : Form
         }
 
         var averageBytesPerSecond = Math.Max(1, session.Format.AverageBytesPerSecond);
-        var chunkEndUtc = DateTime.UtcNow;
-        var chunkDurationSeconds = data.Length / (double)averageBytesPerSecond;
-        var chunkStartUtc = chunkEndUtc.AddSeconds(-chunkDurationSeconds);
+        var durationSeconds = data.Length / (double)averageBytesPerSecond;
+        var receivedUtc = DateTime.UtcNow;
+        var cutoffUtc = receivedUtc.AddSeconds(-(BufferSeconds + 20));
 
         lock (session.Lock)
         {
-            session.Ring.AddRange(data);
-            session.Chunks.Add(new AudioChunk(chunkStartUtc, chunkEndUtc, data));
-
-            var maxBytes = averageBytesPerSecond * (BufferSeconds + 15);
-            if (session.Ring.Count > maxBytes)
+            if (!session.HasTimeline)
             {
-                session.Ring.RemoveRange(0, session.Ring.Count - maxBytes);
+                session.TimelineStartUtc = receivedUtc.AddSeconds(-durationSeconds);
+                session.TimelineBytes = 0;
+                session.HasTimeline = true;
             }
 
-            var cutoffUtc = DateTime.UtcNow.AddSeconds(-(BufferSeconds + 15));
+            var startUtc = session.TimelineStartUtc.AddSeconds(session.TimelineBytes / (double)averageBytesPerSecond);
+            session.TimelineBytes += data.Length;
+            var endUtc = session.TimelineStartUtc.AddSeconds(session.TimelineBytes / (double)averageBytesPerSecond);
+
+            session.Chunks.Add(new AudioChunk(startUtc, endUtc, data));
             session.Chunks.RemoveAll(chunk => chunk.EndUtc < cutoffUtc);
         }
     }
@@ -1338,61 +1375,94 @@ internal sealed class MainForm : Form
         }
     }
 
-    private async Task<List<string>> WriteRecentAudioFilesAsync(string folder, DateTime clipStartUtc, DateTime clipEndUtc)
+    private async Task<List<string>> WriteTimedAudioFilesAsync(string folder, DateTime clipStartUtc, DateTime clipEndUtc)
     {
         var files = new List<string>();
-        var delayMs = Clamp(AudioDelayBaseMs + _settings.AudioDelayMs, 0, 10000);
-        var audioStartUtc = clipStartUtc.AddMilliseconds(-delayMs);
-        var audioEndUtc = clipEndUtc.AddMilliseconds(-delayMs);
+        var durationSeconds = Math.Max(0.1, (clipEndUtc - clipStartUtc).TotalSeconds);
+        var delayMs = Clamp(_settings.AudioDelayMs, -AudioDelayLimitMs, AudioDelayLimitMs);
+        var delaySeconds = delayMs / 1000.0;
         var index = 0;
 
         foreach (var session in _audioSessions.ToList())
         {
-            byte[] audioBytes;
             var format = session.Format;
+            var averageBytesPerSecond = Math.Max(1, format.AverageBytesPerSecond);
+            var blockAlign = Math.Max(1, format.BlockAlign);
+            var totalBytes = AlignToBlock((int)Math.Ceiling(averageBytesPerSecond * durationSeconds), blockAlign);
+            if (totalBytes <= blockAlign * 100)
+            {
+                continue;
+            }
+
+            var outputBytes = new byte[totalBytes];
+            List<AudioChunk> chunks;
 
             lock (session.Lock)
             {
-                if (session.Chunks.Count == 0)
+                chunks = session.Chunks
+                    .Where(chunk => chunk.EndUtc >= clipStartUtc.AddSeconds(-Math.Abs(delaySeconds) - 1) && chunk.StartUtc <= clipEndUtc.AddSeconds(Math.Abs(delaySeconds) + 1))
+                    .Select(chunk => new AudioChunk(chunk.StartUtc, chunk.EndUtc, chunk.Data.ToArray()))
+                    .ToList();
+            }
+
+            var copiedBytes = 0;
+            foreach (var chunk in chunks)
+            {
+                if (chunk.Data.Length < blockAlign)
                 {
                     continue;
                 }
 
-                var blockAlign = Math.Max(1, format.BlockAlign);
-                var averageBytesPerSecond = Math.Max(1, format.AverageBytesPerSecond);
-                using var stream = new MemoryStream();
+                var chunkStartInOutput = (chunk.StartUtc - clipStartUtc).TotalSeconds + delaySeconds;
+                var chunkEndInOutput = (chunk.EndUtc - clipStartUtc).TotalSeconds + delaySeconds;
+                var outputStartSeconds = Math.Max(0, chunkStartInOutput);
+                var outputEndSeconds = Math.Min(durationSeconds, chunkEndInOutput);
 
-                foreach (var chunk in session.Chunks.Where(chunk => chunk.EndUtc > audioStartUtc && chunk.StartUtc < audioEndUtc).OrderBy(chunk => chunk.StartUtc))
+                if (outputEndSeconds <= outputStartSeconds)
                 {
-                    var startOffsetBytes = 0;
-                    var endOffsetBytes = chunk.Data.Length;
-
-                    if (chunk.StartUtc < audioStartUtc)
-                    {
-                        var skipSeconds = Math.Max(0, (audioStartUtc - chunk.StartUtc).TotalSeconds);
-                        startOffsetBytes = AlignToBlock((int)(averageBytesPerSecond * skipSeconds), blockAlign);
-                    }
-
-                    if (chunk.EndUtc > audioEndUtc)
-                    {
-                        var keepSeconds = Math.Max(0, (audioEndUtc - chunk.StartUtc).TotalSeconds);
-                        endOffsetBytes = AlignToBlock((int)(averageBytesPerSecond * keepSeconds), blockAlign);
-                    }
-
-                    startOffsetBytes = Math.Max(0, Math.Min(startOffsetBytes, chunk.Data.Length));
-                    endOffsetBytes = Math.Max(startOffsetBytes, Math.Min(endOffsetBytes, chunk.Data.Length));
-                    var count = AlignToBlock(endOffsetBytes - startOffsetBytes, blockAlign);
-
-                    if (count > 0 && startOffsetBytes + count <= chunk.Data.Length)
-                    {
-                        stream.Write(chunk.Data, startOffsetBytes, count);
-                    }
+                    continue;
                 }
 
-                audioBytes = stream.ToArray();
+                var sourceOffsetSeconds = outputStartSeconds - chunkStartInOutput;
+                var sourceByte = AlignToBlock((int)Math.Floor(sourceOffsetSeconds * averageBytesPerSecond), blockAlign);
+                var targetByte = AlignToBlock((int)Math.Floor(outputStartSeconds * averageBytesPerSecond), blockAlign);
+                var bytesToCopy = AlignToBlock((int)Math.Ceiling((outputEndSeconds - outputStartSeconds) * averageBytesPerSecond), blockAlign);
+
+                if (sourceByte < 0)
+                {
+                    var adjust = AlignToBlock(-sourceByte, blockAlign);
+                    sourceByte += adjust;
+                    targetByte += adjust;
+                    bytesToCopy -= adjust;
+                }
+
+                if (targetByte < 0)
+                {
+                    var adjust = AlignToBlock(-targetByte, blockAlign);
+                    targetByte += adjust;
+                    sourceByte += adjust;
+                    bytesToCopy -= adjust;
+                }
+
+                if (sourceByte >= chunk.Data.Length || targetByte >= outputBytes.Length || bytesToCopy <= 0)
+                {
+                    continue;
+                }
+
+                bytesToCopy = Math.Min(bytesToCopy, chunk.Data.Length - sourceByte);
+                bytesToCopy = Math.Min(bytesToCopy, outputBytes.Length - targetByte);
+                bytesToCopy = AlignToBlock(bytesToCopy, blockAlign);
+
+                if (bytesToCopy <= 0)
+                {
+                    continue;
+                }
+
+                Buffer.BlockCopy(chunk.Data, sourceByte, outputBytes, targetByte, bytesToCopy);
+                copiedBytes += bytesToCopy;
             }
 
-            if (audioBytes.Length < 1024)
+            if (copiedBytes < blockAlign * 100)
             {
                 continue;
             }
@@ -1401,13 +1471,18 @@ internal sealed class MainForm : Form
             await Task.Run(() =>
             {
                 using var writer = new WaveFileWriter(path, format);
-                writer.Write(audioBytes, 0, audioBytes.Length);
+                writer.Write(outputBytes, 0, outputBytes.Length);
             });
 
             if (File.Exists(path) && new FileInfo(path).Length > 1024)
             {
                 files.Add(path);
             }
+        }
+
+        if (files.Count > 0)
+        {
+            Log($"연속 타임라인 오디오 추출: {files.Count}개 / 보정 {delayMs}ms");
         }
 
         return files;
@@ -1432,8 +1507,7 @@ internal sealed class MainForm : Form
         }
 
         var segmentInfos = GetCompletedSegmentInfos().TakeLast(BufferSeconds).ToList();
-        var segments = segmentInfos.Select(segment => segment.Path).ToList();
-        if (segments.Count == 0)
+        if (segmentInfos.Count == 0)
         {
             Log("저장할 영상이 아직 없습니다. 상시녹화를 잠시 유지한 뒤 다시 저장해 주세요.");
             return;
@@ -1443,9 +1517,10 @@ internal sealed class MainForm : Form
         _saveButton.Enabled = false;
         _statusLabel.Text = "클립 저장 중";
 
-        var seconds = Math.Min(BufferSeconds, segments.Count);
-        var clipEndUtc = segmentInfos.Last().LastWriteTimeUtc;
-        var clipStartUtc = clipEndUtc.AddSeconds(-seconds);
+        var segments = segmentInfos.Select(segment => segment.Path).ToList();
+        var clipStartUtc = segmentInfos.First().StartUtc;
+        var clipEndUtc = segmentInfos.Last().EndUtc;
+        var seconds = Math.Min(BufferSeconds, Math.Max(1, (int)Math.Round((clipEndUtc - clipStartUtc).TotalSeconds)));
         var workFolder = Path.Combine(AppPaths.LocalAppDataFolder, "clipwork", Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(workFolder);
 
@@ -1464,7 +1539,7 @@ internal sealed class MainForm : Form
             }
 
             var ffmpegPath = EnsureFfmpeg();
-            Log($"클립 생성 중: {segments.Count}개 조각 / 약 {seconds}초");
+            Log($"클립 생성 중: {segments.Count}개 조각 / 실제 시간 {clipStartUtc.ToLocalTime():HH:mm:ss}~{clipEndUtc.ToLocalTime():HH:mm:ss} / 약 {seconds}초");
 
             var copyArgs = $"-hide_banner -loglevel warning -y -fflags +genpts -i \"{joinedTsPath}\" -map 0:v:0 -c:v copy -an -movflags +faststart \"{tempVideoPath}\"";
             var copyResult = await RunProcessAsync(ffmpegPath, copyArgs);
@@ -1490,7 +1565,7 @@ internal sealed class MainForm : Form
             }
 
             var audioAdded = false;
-            var audioFiles = _settings.IncludeAudio ? await WriteRecentAudioFilesAsync(workFolder, clipStartUtc, clipEndUtc) : new List<string>();
+            var audioFiles = _settings.IncludeAudio ? await WriteTimedAudioFilesAsync(workFolder, clipStartUtc, clipEndUtc) : new List<string>();
 
             if (audioFiles.Count > 0)
             {
@@ -1503,16 +1578,15 @@ internal sealed class MainForm : Form
                 }
 
                 string muxArgs;
-                var clipDurationText = seconds.ToString(CultureInfo.InvariantCulture);
 
                 if (audioFiles.Count == 1)
                 {
-                    muxArgs = inputArgs + $"-map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -b:a 192k -t {clipDurationText} -movflags +faststart \"{outputPath}\"";
+                    muxArgs = inputArgs + $"-map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -b:a 192k -shortest -movflags +faststart \"{outputPath}\"";
                 }
                 else
                 {
                     var filterInputs = string.Concat(Enumerable.Range(1, audioFiles.Count).Select(i => $"[{i}:a]"));
-                    muxArgs = inputArgs + $"-filter_complex \"{filterInputs}amix=inputs={audioFiles.Count}:duration=longest:dropout_transition=0[aout]\" -map 0:v:0 -map \"[aout]\" -c:v copy -c:a aac -b:a 192k -t {clipDurationText} -movflags +faststart \"{outputPath}\"";
+                    muxArgs = inputArgs + $"-filter_complex \"{filterInputs}amix=inputs={audioFiles.Count}:duration=longest:dropout_transition=0[aout]\" -map 0:v:0 -map \"[aout]\" -c:v copy -c:a aac -b:a 192k -shortest -movflags +faststart \"{outputPath}\"";
                 }
 
                 var muxResult = await RunProcessAsync(ffmpegPath, muxArgs);
@@ -1572,12 +1646,17 @@ internal sealed class MainForm : Form
     private void UpdateBufferState()
     {
         CleanBufferFolder(false);
-        var count = GetCompletedSegmentInfos().Count;
+        var count = GetCompletedSegments().Count;
         var available = Math.Min(BufferSeconds, count);
         var audioStatus = _settings.IncludeAudio ? (_audioRunning ? $" / 오디오 {_audioSessions.Count}개 녹음 중" : " / 오디오 대기") : "";
         _availableLabel.Text = $"저장 가능 영상 : {available}초 / {BufferSeconds}초 ({count}개 조각){audioStatus}";
         _toggleRecordButton.Text = _recording ? "상시녹화 중지" : "상시녹화 시작";
         _engineLabel.Text = "캡처 엔진 : " + _activeEngineName;
+    }
+
+    private List<string> GetCompletedSegments()
+    {
+        return GetCompletedSegmentInfos().Select(segment => segment.Path).ToList();
     }
 
     private List<SegmentInfo> GetCompletedSegmentInfos()
@@ -1591,14 +1670,34 @@ internal sealed class MainForm : Form
         return Directory.GetFiles(AppPaths.BufferFolder, "seg_*.ts")
             .Select(path => new FileInfo(path))
             .Where(file => file.Exists && file.Length > 1024 * 100 && (now - file.LastWriteTime).TotalMilliseconds > 2200)
-            .OrderBy(file => file.LastWriteTimeUtc)
-            .Select(file => new SegmentInfo(file.FullName, file.LastWriteTimeUtc))
+            .Select(file => TryCreateSegmentInfo(file, out var segment) ? segment : (SegmentInfo?)null)
+            .Where(segment => segment.HasValue)
+            .Select(segment => segment!.Value)
+            .OrderBy(segment => segment.StartUtc)
             .ToList();
     }
 
-    private List<string> GetCompletedSegments()
+    private static bool TryCreateSegmentInfo(FileInfo file, out SegmentInfo segment)
     {
-        return GetCompletedSegmentInfos().Select(segment => segment.Path).ToList();
+        segment = default;
+        var name = Path.GetFileNameWithoutExtension(file.Name);
+        const string prefix = "seg_";
+
+        if (name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+        {
+            var text = name[prefix.Length..];
+            if (DateTime.TryParseExact(text, "yyyyMMdd_HHmmss", CultureInfo.InvariantCulture, DateTimeStyles.None, out var localStart))
+            {
+                localStart = DateTime.SpecifyKind(localStart, DateTimeKind.Local);
+                var startUtc = localStart.ToUniversalTime();
+                segment = new SegmentInfo(file.FullName, startUtc, startUtc.AddSeconds(1));
+                return true;
+            }
+        }
+
+        var fallbackEndUtc = file.LastWriteTimeUtc;
+        segment = new SegmentInfo(file.FullName, fallbackEndUtc.AddSeconds(-1), fallbackEndUtc);
+        return true;
     }
 
     private void CleanBufferFolder(bool all)
@@ -2402,9 +2501,11 @@ try { Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContin
         public WaveFormat Format { get; }
         public bool IsMic { get; }
         public object Lock { get; } = new();
-        public List<byte> Ring { get; } = new();
         public List<AudioChunk> Chunks { get; } = new();
         public bool IsRunning { get; set; }
+        public bool HasTimeline { get; set; }
+        public DateTime TimelineStartUtc { get; set; }
+        public long TimelineBytes { get; set; }
     }
 
     private sealed class MicMonitorSession
@@ -2421,9 +2522,9 @@ try { Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContin
         public BufferedWaveProvider Buffer { get; }
     }
 
-    private readonly record struct CaptureAttempt(string Name, string Arguments);
-    private readonly record struct SegmentInfo(string Path, DateTime LastWriteTimeUtc);
     private readonly record struct AudioChunk(DateTime StartUtc, DateTime EndUtc, byte[] Data);
+    private readonly record struct SegmentInfo(string Path, DateTime StartUtc, DateTime EndUtc);
+    private readonly record struct CaptureAttempt(string Name, string Arguments);
     private readonly record struct ProcessResult(int ExitCode, string OutputText, string ErrorText);
     private readonly record struct UpdateAsset(string Name, string DownloadUrl);
 }
@@ -2436,7 +2537,7 @@ internal sealed class AppSettings
     public bool IncludeAudio { get; set; } = true;
     public List<string> OutputDeviceIds { get; set; } = new();
     public List<string> MicDeviceIds { get; set; } = new();
-    public int AudioDelayMs { get; set; } = 3500;
+    public int AudioDelayMs { get; set; } = 0;
     public bool AudioDelayBaseMigrated { get; set; } = false;
     public int MicVolumePercent { get; set; } = 100;
     public bool DrawMouse { get; set; } = false;
@@ -2459,11 +2560,14 @@ internal sealed class AppSettings
         MicDeviceIds ??= new List<string>();
         if (!AudioDelayBaseMigrated)
         {
-            AudioDelayMs -= 3500;
+            if (AudioDelayMs == 3500)
+            {
+                AudioDelayMs = 0;
+            }
             AudioDelayBaseMigrated = true;
         }
 
-        AudioDelayMs = Math.Max(-3500, Math.Min(5000, AudioDelayMs));
+        AudioDelayMs = Math.Max(-5000, Math.Min(5000, AudioDelayMs));
         MicVolumePercent = Math.Max(50, Math.Min(500, MicVolumePercent));
 
         if (string.IsNullOrWhiteSpace(OutputFolder))
